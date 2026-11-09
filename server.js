@@ -14,9 +14,9 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 const PORT = process.env.PORT || 3001;
-const LILA_SECRET_KEY = process.env.LILA_SECRET_KEY || "lila_secret_2026";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
+const LILA_SECRET_KEY = (process.env.LILA_SECRET_KEY || "lila_secret_2026").trim();
+let GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
+let GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
 const OWNER_PHONE = (process.env.OWNER_PHONE || "").replace(/\D/g, "");
 
 // Estado en memoria del nodo en la nube
@@ -25,8 +25,31 @@ let latestQrDataUrl = null;
 let connectionStatus = "initializing"; // initializing | qr_ready | connected | disconnected
 let connectedNumber = null;
 
-// Bandeja de últimos 50 mensajes recibidos
+// Caché de mensajes enviados para el protocolo Signal de WhatsApp (evita el aviso "Esperando el mensaje...")
+const sentMessagesCache = new Map();
+function rememberSentMessage(sentMsg) {
+  if (sentMsg?.key?.id && sentMsg?.message) {
+    sentMessagesCache.set(sentMsg.key.id, sentMsg.message);
+    if (sentMessagesCache.size > 200) {
+      const firstKey = sentMessagesCache.keys().next().value;
+      sentMessagesCache.delete(firstKey);
+    }
+  }
+}
+
+async function safeSendMessage(jid, content) {
+  if (!sock) throw new Error("Socket de WhatsApp no inicializado");
+  const sent = await sock.sendMessage(jid, content);
+  rememberSentMessage(sent);
+  return sent;
+}
+
+// Bandeja de últimos 50 mensajes recibidos de WhatsApp
 const inboxMessages = [];
+// Últimos correos recibidos desde Google Apps Script
+const recentEmails = [];
+// Historial conversacional por usuario en WhatsApp para mantener contexto ("háblame más de eso", "sí", etc.)
+const chatHistoryByJid = new Map();
 // Contactos aprendidos automáticamente de conversaciones entrantes { nombre_lower: jid }
 const learnedContacts = {};
 
@@ -70,35 +93,83 @@ function toWhatsAppJid(target) {
   return `${digits}@s.whatsapp.net`;
 }
 
-// Consulta rápida a Gemini o Groq cuando el portátil está apagado
-async function askLilaCloudAI(userPrompt) {
+// Consulta con memoria conversacional y contexto real a Gemini o Groq
+async function askLilaCloudAI(userPrompt, jid = "default") {
+  const emailContext =
+    recentEmails.length > 0
+      ? "\nÚltimos correos reales registrados:\n" +
+        recentEmails
+          .slice(-5)
+          .map((e, i) => `${i + 1}. [${e.account}] De: ${e.from} | Asunto: ${e.subject} | Resumen: ${e.snippet}`)
+          .join("\n")
+      : "\nNota de correos: Aún no han entrado correos nuevos al vigía de la nube en esta sesión. NUNCA inventes correos ni digas que tienes un resumen listo si esta lista está vacía.";
+
+  const activeScheds = schedules.filter((s) => s.active);
+  const schedContext =
+    activeScheds.length > 0
+      ? "\nRutinas programadas activas:\n" +
+        activeScheds.map((s) => `- Para ${s.target} a las ${s.time}: ${s.message}`).join("\n")
+      : "\nRutinas programadas activas: Ninguna.";
+
   const systemPrompt =
     "Eres LILA 2.0 (Núcleo en la Nube 24/7), el asistente personal tipo J.A.R.V.I.S. del Señor Carlos. " +
-    "Responde de forma elegante, breve, leal y directa en español.";
+    "Responde de forma elegante, breve, leal y directa en español. " +
+    "Mantén el hilo de la conversación previa y NUNCA digas '¿Desea que se lo presente?' sin entregar la información de inmediato." +
+    emailContext +
+    schedContext;
+
+  const history = chatHistoryByJid.get(jid) || [];
+  let lastError = "";
 
   if (GEMINI_API_KEY) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+      const geminiContents = [
+        ...history.map((h) => ({
+          role: h.role === "assistant" ? "model" : "user",
+          parts: [{ text: h.text }],
+        })),
+        { role: "user", parts: [{ text: userPrompt }] },
+      ];
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+          contents: geminiContents,
         }),
       });
       if (res.ok) {
         const data = await res.json();
         const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) return text.trim();
+        if (text) {
+          const cleanReply = text.trim();
+          if (jid !== "routine") {
+            history.push({ role: "user", text: userPrompt });
+            history.push({ role: "assistant", text: cleanReply });
+            if (history.length > 12) history.splice(0, history.length - 12);
+            chatHistoryByJid.set(jid, history);
+          }
+          return cleanReply;
+        }
+      } else {
+        const errBody = await res.text();
+        lastError = `Gemini HTTP ${res.status}: ${errBody.slice(0, 120)}`;
+        console.error(lastError);
       }
     } catch (e) {
+      lastError = `Gemini Error: ${e.message}`;
       console.error("Error Gemini Cloud:", e.message);
     }
   }
 
   if (GROQ_API_KEY) {
     try {
+      const groqMessages = [
+        { role: "system", content: systemPrompt },
+        ...history.map((h) => ({ role: h.role, content: h.text })),
+        { role: "user", content: userPrompt },
+      ];
       const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -107,24 +178,30 @@ async function askLilaCloudAI(userPrompt) {
         },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
-          messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userPrompt },
-          ],
-          max_tokens: 400,
+          messages: groqMessages,
+          max_tokens: 450,
         }),
       });
       if (res.ok) {
         const data = await res.json();
         const text = data?.choices?.[0]?.message?.content;
-        if (text) return text.trim();
+        if (text) {
+          const cleanReply = text.trim();
+          if (jid !== "routine") {
+            history.push({ role: "user", text: userPrompt });
+            history.push({ role: "assistant", text: cleanReply });
+            if (history.length > 12) history.splice(0, history.length - 12);
+            chatHistoryByJid.set(jid, history);
+          }
+          return cleanReply;
+        }
       }
     } catch (e) {
       console.error("Error Groq Cloud:", e.message);
     }
   }
 
-  return "Señor Carlos, el nodo en la nube está activo, pero falta configurar GEMINI_API_KEY o GROQ_API_KEY en las variables de entorno de Render.";
+  return `Señor Carlos, el nodo en la nube está activo, pero los proveedores de IA devolvieron error (${lastError || "sin llaves"}).`;
 }
 
 // Inicialización de conexión con WhatsApp vía WebSockets (Baileys)
@@ -139,6 +216,15 @@ async function startWhatsApp() {
     logger: pino({ level: "silent" }),
     printQRInTerminal: true,
     browser: ["LILA 2.0 Cloud", "Chrome", "2.0.0"],
+    syncFullHistory: false,
+    markOnlineOnConnect: false,
+    // CRÍTICO: Devuelve el mensaje en caché cuando WhatsApp en el teléfono o PC solicita reintentar el descifrado Signal
+    getMessage: async (key) => {
+      if (key?.id && sentMessagesCache.has(key.id)) {
+        return sentMessagesCache.get(key.id);
+      }
+      return { conversation: "Mensaje de LILA 2.0" };
+    },
   });
 
   sock.ev.on("creds.update", saveCreds);
@@ -209,7 +295,7 @@ async function startWhatsApp() {
         if (inboxMessages.length > 50) inboxMessages.shift();
       }
 
-      // Si el Señor Carlos escribe un mensaje que empieza por "Lila," o "Lila " (incluso a sí mismo con el portátil apagado)
+      // Si el Señor Carlos escribe un mensaje que empieza por "Lila," o "Lila "
       const cleanText = text.trim();
       const isCommandForLila = /^lila[,:\s]+/i.test(cleanText);
       const isOwnerOrSelf =
@@ -220,8 +306,8 @@ async function startWhatsApp() {
       if (isCommandForLila && isOwnerOrSelf) {
         const query = cleanText.replace(/^lila[,:\s]+/i, "").trim();
         if (query && !cleanText.startsWith("🤖 *LILA:*")) {
-          const reply = await askLilaCloudAI(query);
-          await sock.sendMessage(remoteJid, { text: `🤖 *LILA:* ${reply}` });
+          const reply = await askLilaCloudAI(query, remoteJid);
+          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply}` });
         }
       }
     }
@@ -260,7 +346,6 @@ async function evaluateSchedules() {
   let changed = false;
   for (const item of schedules) {
     if (!item.active) continue;
-    // Coincidencia de hora HH:MM (o si ya pasó la hora hoy y no se ha enviado hoy)
     if (item.time <= currentHHMM && item.lastSentDate !== todayStr) {
       const jid = toWhatsAppJid(item.target);
       if (!jid) continue;
@@ -268,12 +353,13 @@ async function evaluateSchedules() {
       let finalMessage = item.message;
       if (item.useAI) {
         finalMessage = await askLilaCloudAI(
-          `Redacta únicamente el texto del mensaje de WhatsApp para '${item.target}' con esta instrucción: ${item.message}. Sin comillas ni explicaciones extras.`
+          `Redacta únicamente el texto del mensaje de WhatsApp para '${item.target}' con esta instrucción: ${item.message}. Sin comillas ni explicaciones extras.`,
+          "routine"
         );
       }
 
       try {
-        await sock.sendMessage(jid, { text: finalMessage });
+        await safeSendMessage(jid, { text: finalMessage });
         item.lastSentDate = todayStr;
         if (!item.recurring) {
           item.active = false;
@@ -288,11 +374,10 @@ async function evaluateSchedules() {
   if (changed) saveSchedules();
 }
 
-setInterval(evaluateSchedules, 45 * 1000);
+setInterval(evaluateSchedules, 30 * 1000);
 
 // --- RUTAS DEL SERVIDOR ---
 
-// 1. Latido / Marcapasos (mantiene despierto a Render 24/7 y evalúa rutinas)
 app.get("/ping", async (req, res) => {
   await evaluateSchedules();
   res.json({
@@ -305,7 +390,6 @@ app.get("/ping", async (req, res) => {
   });
 });
 
-// 2. Vista web para escanear el código QR cómodamente desde el navegador
 app.get("/qr", requireAuth, (req, res) => {
   if (connectionStatus === "connected") {
     return res.send(`
@@ -335,7 +419,6 @@ app.get("/qr", requireAuth, (req, res) => {
   `);
 });
 
-// 3. Enviar mensaje de WhatsApp en segundo plano (0 ventanas en el PC)
 app.post("/send", requireAuth, async (req, res) => {
   try {
     if (connectionStatus !== "connected" || !sock) {
@@ -356,14 +439,13 @@ app.post("/send", requireAuth, async (req, res) => {
         error: `No se pudo resolver el número o contacto '${target}'.`,
       });
     }
-    await sock.sendMessage(jid, { text: String(message) });
+    await safeSendMessage(jid, { text: String(message) });
     return res.json({ success: true, to: jid });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 4. Leer últimos mensajes recibidos
 app.get("/messages", requireAuth, (req, res) => {
   const filter = String(req.query.contact || "").toLowerCase().trim();
   let list = inboxMessages;
@@ -373,9 +455,8 @@ app.get("/messages", requireAuth, (req, res) => {
   res.json(list.slice(-20));
 });
 
-// 5. Programar recordatorio o rutina diaria (funciona con el portátil apagado)
 app.post("/schedule", requireAuth, (req, res) => {
-  const { target, message, time, recurring = true, useAI = false } = req.body;
+  const { target, message, time, recurring = false, useAI = false } = req.body;
   if (!target || !message || !time) {
     return res.status(400).json({ success: false, error: "Se requieren 'target', 'message' y 'time' (HH:MM)." });
   }
@@ -383,7 +464,7 @@ app.post("/schedule", requireAuth, (req, res) => {
     id: Date.now().toString(36),
     target,
     message,
-    time, // Formato "08:00" (Hora Colombia)
+    time,
     recurring: Boolean(recurring),
     useAI: Boolean(useAI),
     active: true,
@@ -398,18 +479,40 @@ app.get("/schedules", requireAuth, (req, res) => {
   res.json(schedules.filter((s) => s.active));
 });
 
-// 6. Alerta de correo importante recibida desde el vigía de Google Apps Script
+app.post("/schedule/cancel", requireAuth, (req, res) => {
+  const target = String(req.body.target || "").toLowerCase().trim();
+  const contact = String(req.body.contact || "").toLowerCase().trim();
+  let removed = 0;
+  for (const s of schedules) {
+    if (!s.active) continue;
+    const sTarget = String(s.target || "").toLowerCase();
+    if (!target && !contact) {
+      s.active = false;
+      removed++;
+    } else if ((target && sTarget.includes(target)) || (contact && sTarget.includes(contact))) {
+      s.active = false;
+      removed++;
+    }
+  }
+  saveSchedules();
+  res.json({ success: true, removed });
+});
+
 app.post("/gmail-alert", requireAuth, async (req, res) => {
   try {
     const { from, subject, snippet, account = "Gmail" } = req.body;
+    recentEmails.push({ from, subject, snippet, account, time: new Date().toISOString() });
+    if (recentEmails.length > 15) recentEmails.shift();
+
     const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
     if (!ownerJid || connectionStatus !== "connected" || !sock) {
       return res.status(503).json({ success: false, error: "WhatsApp no conectado para enviar alerta." });
     }
     const summary = await askLilaCloudAI(
-      `Llegó un correo nuevo a la cuenta '${account}' del Señor Carlos.\nDe: ${from}\nAsunto: ${subject}\nContenido: ${snippet}\nHaz un aviso de máximo 2 líneas para enviárselo por WhatsApp.`
+      `Llegó un correo nuevo a la cuenta '${account}' del Señor Carlos.\nDe: ${from}\nAsunto: ${subject}\nContenido: ${snippet}\nHaz un aviso de máximo 2 líneas para enviárselo por WhatsApp.`,
+      "routine"
     );
-    await sock.sendMessage(ownerJid, {
+    await safeSendMessage(ownerJid, {
       text: `📧 *Alerta de Correo (${account})*\n*De:* ${from}\n*Asunto:* ${subject}\n\n🤖 *LILA:* ${summary}`,
     });
     res.json({ success: true });
