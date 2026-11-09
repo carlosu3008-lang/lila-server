@@ -25,12 +25,30 @@ let latestQrDataUrl = null;
 let connectionStatus = "initializing"; // initializing | qr_ready | connected | disconnected
 let connectedNumber = null;
 
-// Caché de mensajes enviados para el protocolo Signal de WhatsApp (evita el aviso "Esperando el mensaje...")
+// 1. Caché compatible con NodeCache para msgRetryCounterCache de Baileys (crítico para evitar "Esperando el mensaje...")
+function createSimpleCache(maxEntries = 500) {
+  const store = new Map();
+  return {
+    get: (key) => store.get(key),
+    set: (key, val) => {
+      store.set(key, val);
+      if (store.size > maxEntries) {
+        const oldest = store.keys().next().value;
+        store.delete(oldest);
+      }
+    },
+    del: (key) => store.delete(key),
+    flushAll: () => store.clear(),
+  };
+}
+
+const msgRetryCounterCache = createSimpleCache(1000);
 const sentMessagesCache = new Map();
-function rememberSentMessage(sentMsg) {
-  if (sentMsg?.key?.id && sentMsg?.message) {
-    sentMessagesCache.set(sentMsg.key.id, sentMsg.message);
-    if (sentMessagesCache.size > 200) {
+
+function rememberSentMessage(msgObj) {
+  if (msgObj?.key?.id && msgObj?.message) {
+    sentMessagesCache.set(msgObj.key.id, msgObj.message);
+    if (sentMessagesCache.size > 400) {
       const firstKey = sentMessagesCache.keys().next().value;
       sentMessagesCache.delete(firstKey);
     }
@@ -48,7 +66,7 @@ async function safeSendMessage(jid, content) {
 const inboxMessages = [];
 // Últimos correos recibidos desde Google Apps Script
 const recentEmails = [];
-// Historial conversacional por usuario en WhatsApp para mantener contexto ("háblame más de eso", "sí", etc.)
+// Historial conversacional por usuario en WhatsApp
 const chatHistoryByJid = new Map();
 // Contactos aprendidos automáticamente de conversaciones entrantes { nombre_lower: jid }
 const learnedContacts = {};
@@ -76,9 +94,8 @@ function saveSchedules() {
 function toWhatsAppJid(target) {
   if (!target) return null;
   const raw = String(target).trim();
-  if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us")) return raw;
+  if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us") || raw.includes("@lid")) return raw;
 
-  // Buscar por nombre en contactos aprendidos
   const lower = raw.toLowerCase();
   if (learnedContacts[lower]) return learnedContacts[lower];
   for (const [name, jid] of Object.entries(learnedContacts)) {
@@ -93,7 +110,56 @@ function toWhatsAppJid(target) {
   return `${digits}@s.whatsapp.net`;
 }
 
-// Consulta con memoria conversacional y contexto real a Gemini o Groq
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Llamada resiliente a Gemini con cascada automática de modelos ante picos de demanda (HTTP 503 / 429)
+async function callGeminiWithFallback(systemPrompt, geminiContents) {
+  if (!GEMINI_API_KEY) return { ok: false, error: "Sin GEMINI_API_KEY" };
+
+  // Cascada de modelos oficiales: si el primero tiene alta demanda (503), salta de inmediato al siguiente
+  const modelsToTry = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+  ];
+
+  let lastError = "";
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const modelName = modelsToTry[i];
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: geminiContents,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text && text.trim()) {
+          return { ok: true, text: text.trim() };
+        }
+      } else {
+        const errBody = await res.text();
+        lastError = `Gemini (${modelName}) HTTP ${res.status}: ${errBody.slice(0, 100)}`;
+        console.warn(lastError);
+        // Si es 503 (alta demanda) o 429, esperar un instante antes de probar el modelo de respaldo
+        if (res.status === 503 || res.status === 429) {
+          await sleep(1500);
+        }
+      }
+    } catch (e) {
+      lastError = `Gemini (${modelName}) Error: ${e.message}`;
+      console.error(lastError);
+    }
+  }
+  return { ok: false, error: lastError };
+}
+
+// Consulta con memoria conversacional y contexto real a Gemini o Groq (para el Señor Carlos)
 async function askLilaCloudAI(userPrompt, jid = "default") {
   const emailContext =
     recentEmails.length > 0
@@ -119,50 +185,27 @@ async function askLilaCloudAI(userPrompt, jid = "default") {
     schedContext;
 
   const history = chatHistoryByJid.get(jid) || [];
-  let lastError = "";
+  const geminiContents = [
+    ...history.map((h) => ({
+      role: h.role === "assistant" ? "model" : "user",
+      parts: [{ text: h.text }],
+    })),
+    { role: "user", parts: [{ text: userPrompt }] },
+  ];
 
-  if (GEMINI_API_KEY) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-      const geminiContents = [
-        ...history.map((h) => ({
-          role: h.role === "assistant" ? "model" : "user",
-          parts: [{ text: h.text }],
-        })),
-        { role: "user", parts: [{ text: userPrompt }] },
-      ];
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          contents: geminiContents,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) {
-          const cleanReply = text.trim();
-          if (jid !== "routine") {
-            history.push({ role: "user", text: userPrompt });
-            history.push({ role: "assistant", text: cleanReply });
-            if (history.length > 12) history.splice(0, history.length - 12);
-            chatHistoryByJid.set(jid, history);
-          }
-          return cleanReply;
-        }
-      } else {
-        const errBody = await res.text();
-        lastError = `Gemini HTTP ${res.status}: ${errBody.slice(0, 120)}`;
-        console.error(lastError);
-      }
-    } catch (e) {
-      lastError = `Gemini Error: ${e.message}`;
-      console.error("Error Gemini Cloud:", e.message);
+  // 1. Intentar cascada de Gemini (2.5-flash -> 2.0-flash -> 2.5-flash-lite)
+  const gemRes = await callGeminiWithFallback(systemPrompt, geminiContents);
+  if (gemRes.ok && gemRes.text) {
+    if (jid !== "routine") {
+      history.push({ role: "user", text: userPrompt });
+      history.push({ role: "assistant", text: gemRes.text });
+      if (history.length > 12) history.splice(0, history.length - 12);
+      chatHistoryByJid.set(jid, history);
     }
+    return gemRes.text;
   }
 
+  // 2. Intentar respaldo con Groq si está configurado
   if (GROQ_API_KEY) {
     try {
       const groqMessages = [
@@ -185,7 +228,7 @@ async function askLilaCloudAI(userPrompt, jid = "default") {
       if (res.ok) {
         const data = await res.json();
         const text = data?.choices?.[0]?.message?.content;
-        if (text) {
+        if (text && text.trim()) {
           const cleanReply = text.trim();
           if (jid !== "routine") {
             history.push({ role: "user", text: userPrompt });
@@ -201,7 +244,56 @@ async function askLilaCloudAI(userPrompt, jid = "default") {
     }
   }
 
-  return `Señor Carlos, el nodo en la nube está activo, pero los proveedores de IA devolvieron error (${lastError || "sin llaves"}).`;
+  return `Señor Carlos, el nodo en la nube está activo, pero los proveedores de IA devolvieron error (${gemRes.error || "sin llaves"}).`;
+}
+
+// Generador BLINDADO para rutinas hacia contactos (NUNCA envía errores técnicos; si falla todo, envía "Buenos días, ¿Cómo amaneciste?")
+async function generateSafeRoutineMessage(target, instruction) {
+  const FALLBACK_GREETING = "Buenos días, ¿Cómo amaneciste?";
+  const sys =
+    "Redacta únicamente el mensaje de WhatsApp cálido, natural y en primera persona (como si fueras Carlos escribiéndole a su ser querido). " +
+    "Cero comillas, cero introducciones, cero notas de asistente.";
+  const prompt = `Destinatario: '${target}'. Instrucción del mensaje: ${instruction}`;
+
+  const gemRes = await callGeminiWithFallback(sys, [{ role: "user", parts: [{ text: prompt }] }]);
+  if (gemRes.ok && gemRes.text) {
+    const candidate = gemRes.text.replace(/^["']|["']$/g, "").trim();
+    const looksLikeError = /señor carlos|nodo en la nube|http\s*\d{3}|error|api_key|proveedores de ia/i.test(candidate);
+    if (candidate && !looksLikeError) {
+      return candidate;
+    }
+  }
+
+  if (GROQ_API_KEY) {
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages: [
+            { role: "system", content: sys },
+            { role: "user", content: prompt },
+          ],
+          max_tokens: 200,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const candidate = (data?.choices?.[0]?.message?.content || "").replace(/^["']|["']$/g, "").trim();
+        const looksLikeError = /señor carlos|nodo en la nube|http\s*\d{3}|error|api_key|proveedores de ia/i.test(candidate);
+        if (candidate && !looksLikeError) {
+          return candidate;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // Si todos los proveedores fallaron, devolver el saludo seguro solicitado por el usuario
+  return FALLBACK_GREETING;
 }
 
 // Inicialización de conexión con WhatsApp vía WebSockets (Baileys)
@@ -218,12 +310,13 @@ async function startWhatsApp() {
     browser: ["LILA 2.0 Cloud", "Chrome", "2.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: false,
-    // CRÍTICO: Devuelve el mensaje en caché cuando WhatsApp en el teléfono o PC solicita reintentar el descifrado Signal
+    msgRetryCounterCache,
+    // Devuelve únicamente el mensaje real guardado en caché; si no existe, devuelve undefined (nunca un texto falso porque rompe el MAC de Signal)
     getMessage: async (key) => {
       if (key?.id && sentMessagesCache.has(key.id)) {
         return sentMessagesCache.get(key.id);
       }
-      return { conversation: "Mensaje de LILA 2.0" };
+      return undefined;
     },
   });
 
@@ -259,6 +352,11 @@ async function startWhatsApp() {
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    for (const msg of messages) {
+      if (msg?.key?.fromMe && msg?.message) {
+        rememberSentMessage(msg);
+      }
+    }
     if (type !== "notify") return;
     for (const msg of messages) {
       if (!msg.message) continue;
@@ -295,7 +393,6 @@ async function startWhatsApp() {
         if (inboxMessages.length > 50) inboxMessages.shift();
       }
 
-      // Si el Señor Carlos escribe un mensaje que empieza por "Lila," o "Lila "
       const cleanText = text.trim();
       const isCommandForLila = /^lila[,:\s]+/i.test(cleanText);
       const isOwnerOrSelf =
@@ -352,10 +449,7 @@ async function evaluateSchedules() {
 
       let finalMessage = item.message;
       if (item.useAI) {
-        finalMessage = await askLilaCloudAI(
-          `Redacta únicamente el texto del mensaje de WhatsApp para '${item.target}' con esta instrucción: ${item.message}. Sin comillas ni explicaciones extras.`,
-          "routine"
-        );
+        finalMessage = await generateSafeRoutineMessage(item.target, item.message);
       }
 
       try {
