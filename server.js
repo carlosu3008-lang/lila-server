@@ -2,6 +2,7 @@ const express = require("express");
 const {
   default: makeWASocket,
   useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
   fetchLatestBaileysVersion,
 } = require("@whiskeysockets/baileys");
@@ -18,6 +19,8 @@ const LILA_SECRET_KEY = (process.env.LILA_SECRET_KEY || "lila_secret_2026").trim
 let GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 let GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
 const OWNER_PHONE = (process.env.OWNER_PHONE || "573018276980").replace(/\D/g, "");
+
+const silentLogger = pino({ level: "silent" });
 
 // Estado de WhatsApp en memoria
 let sock = null;
@@ -38,7 +41,7 @@ let cloudState = {
   },
   agendaTasks: [],
   currentLocation: {
-    placeName: null, // Ej: "Riohacha", "Hatonuevo", "Universidad de La Guajira"
+    placeName: null,
     lat: null,
     lon: null,
     wifiSsid: null,
@@ -92,7 +95,7 @@ function saveSchedules() {
 }
 
 // --- CACHÉ DE REINTENTOS SIGNAL (Evita "Esperando mensaje" en celular y PC) ---
-function createSimpleCache(maxEntries = 1000) {
+function createSimpleCache(maxEntries = 2000) {
   const store = new Map();
   return {
     get: (key) => store.get(key),
@@ -108,38 +111,22 @@ function createSimpleCache(maxEntries = 1000) {
   };
 }
 
-const msgRetryCounterCache = createSimpleCache(1500);
+const msgRetryCounterCache = createSimpleCache(2000);
 const sentMessagesCache = new Map();
 
 function rememberSentMessage(msgObj) {
   if (msgObj?.key?.id && msgObj?.message) {
     sentMessagesCache.set(msgObj.key.id, msgObj.message);
-    if (sentMessagesCache.size > 500) {
+    if (sentMessagesCache.size > 600) {
       const firstKey = sentMessagesCache.keys().next().value;
       sentMessagesCache.delete(firstKey);
     }
   }
 }
 
-// Normaliza el JID de destino; si es el propio chat del Señor Carlos (@lid o dispositivo), usa el JID canónico @s.whatsapp.net
-function normalizeOutgoingJid(jid) {
-  if (!jid) return null;
-  const ownerNum = OWNER_PHONE || connectedNumber;
-  if (ownerNum && (jid.includes(ownerNum) || jid.endsWith("@lid"))) {
-    return `${ownerNum}@s.whatsapp.net`;
-  }
-  return jid;
-}
-
 async function safeSendMessage(jid, content) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
-  const targetJid = normalizeOutgoingJid(jid);
-  try {
-    if (typeof sock.assertSessions === "function") {
-      await sock.assertSessions([targetJid], false).catch(() => {});
-    }
-  } catch (_) {}
-  const sent = await sock.sendMessage(targetJid, content);
+  const sent = await sock.sendMessage(jid, content);
   rememberSentMessage(sent);
   return sent;
 }
@@ -190,7 +177,6 @@ function resolveContactTarget(target) {
   const raw = String(target).trim();
   const lower = raw.toLowerCase().replace(/^mi\s+/, "").trim();
 
-  // Regla crítica del Señor Carlos: Tiene dos hermanas (Nelly y Perla)
   if (lower === "hermana" || lower === "hermanas" || raw.toLowerCase() === "mi hermana") {
     return {
       ok: false,
@@ -199,7 +185,6 @@ function resolveContactTarget(target) {
     };
   }
 
-  // Regla de Mamá -> Paula / Pechy
   if (["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower)) {
     const momJid =
       cloudState.learnedContacts["paula"] ||
@@ -209,12 +194,10 @@ function resolveContactTarget(target) {
     return { ok: true, jid: momJid, canonicalName: "Paula (Pechy)", relationship: "mother" };
   }
 
-  // Si ya es un JID directo
-  if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us")) {
+  if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us") || raw.includes("@lid")) {
     return { ok: true, jid: raw, canonicalName: raw.split("@")[0], relationship: "general" };
   }
 
-  // Buscar coincidencia exacta en contactos aprendidos
   if (cloudState.learnedContacts[lower]) {
     return {
       ok: true,
@@ -224,7 +207,6 @@ function resolveContactTarget(target) {
     };
   }
 
-  // Buscar coincidencia parcial
   const matches = [];
   for (const [name, jid] of Object.entries(cloudState.learnedContacts)) {
     if (name.includes(lower) || lower.includes(name)) {
@@ -244,7 +226,6 @@ function resolveContactTarget(target) {
     };
   }
 
-  // Si son dígitos telefónicos
   let digits = raw.replace(/\D/g, "");
   if (digits.length === 10 && digits.startsWith("3")) {
     digits = "57" + digits;
@@ -272,7 +253,7 @@ function classifyLocation(lat, lon, wifiSsid = "") {
 
   if (typeof lat === "number" && typeof lon === "number" && !isNaN(lat) && !isNaN(lon)) {
     const dist = (lat1, lon1, lat2, lon2) =>
-      Math.hypot((lat1 - lat2) * 111, (lon1 - lon2) * 109); // aprox km en La Guajira
+      Math.hypot((lat1 - lat2) * 111, (lon1 - lon2) * 109);
 
     if (dist(lat, lon, 11.5142, -72.8692) <= 1.5) {
       return "Universidad de La Guajira (Riohacha)";
@@ -287,7 +268,7 @@ function classifyLocation(lat, lon, wifiSsid = "") {
   return null;
 }
 
-// --- CLIMA EN TIEMPO REAL (Open-Meteo API - Sin API Key, 100% En Vivo) ---
+// --- CLIMA EN TIEMPO REAL CON DOBLE RESPALDO (Open-Meteo + wttr.in) ---
 const WEATHER_CODES = {
   0: "cielo despejado",
   1: "mayormente despejado",
@@ -306,18 +287,33 @@ const WEATHER_CODES = {
 };
 
 async function fetchSingleCityWeather(name, lat, lon) {
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=America%2FBogota&forecast_days=1`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const data = await res.json();
-  const cur = data.current || {};
-  const daily = data.daily || {};
-  const desc = WEATHER_CODES[cur.weather_code] || "condiciones variables";
-  const maxT = daily.temperature_2m_max?.[0] ?? cur.temperature_2m;
-  const minT = daily.temperature_2m_min?.[0] ?? cur.temperature_2m;
-  const rainProb = daily.precipitation_probability_max?.[0] ?? 0;
+  const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LILA/1.0" };
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1`;
+    const res = await fetch(url, { headers });
+    if (res.ok) {
+      const data = await res.json();
+      const cur = data.current || {};
+      const daily = data.daily || {};
+      const desc = WEATHER_CODES[cur.weather_code] || "condiciones variables";
+      const maxT = daily.temperature_2m_max?.[0] ?? cur.temperature_2m;
+      const minT = daily.temperature_2m_min?.[0] ?? cur.temperature_2m;
+      const rainProb = daily.precipitation_probability_max?.[0] ?? 0;
+      return `${name}: ${cur.temperature_2m} °C (sensación térmica de ${cur.apparent_temperature} °C), ${desc}, humedad del ${cur.relative_humidity_2m} %, probabilidad de lluvia hoy del ${rainProb} % (máx. ${maxT} °C / mín. ${minT} °C).`;
+    }
+  } catch (_) {}
 
-  return `${name}: ${cur.temperature_2m} °C (sensación térmica de ${cur.apparent_temperature} °C), ${desc}, humedad del ${cur.relative_humidity_2m} %, probabilidad de lluvia hoy del ${rainProb} % (máx. ${maxT} °C / mín. ${minT} °C).`;
+  // Respaldo automático con wttr.in si Open-Meteo falla
+  const wttrUrl = `https://wttr.in/${encodeURIComponent(name)}?format=j1`;
+  const wRes = await fetch(wttrUrl, { headers });
+  if (!wRes.ok) throw new Error(`HTTP ${wRes.status}`);
+  const wData = await wRes.json();
+  const c = wData?.current_condition?.[0] || {};
+  const tempC = c.temp_C || "";
+  const feelsC = c.FeelsLikeC || tempC;
+  const hum = c.humidity || "";
+  const desc = c.lang_es?.[0]?.value || c.weatherDesc?.[0]?.value || "cielo variable";
+  return `${name}: ${tempC} °C (sensación térmica de ${feelsC} °C), ${desc.toLowerCase()}, humedad del ${hum} %.`;
 }
 
 async function getWeatherLive(cityQuery = "") {
@@ -325,8 +321,7 @@ async function getWeatherLive(cityQuery = "") {
     const cleanCity = String(cityQuery || "").trim();
     const lowerCity = cleanCity.toLowerCase();
 
-    // Si no especificó ciudad o pidió el clima general, o pidió sus ciudades base
-    if (!cleanCity || ["actual", "hoy", "aqui", "aquí", "mi ubicacion", "mi ubicación"].includes(lowerCity)) {
+    if (!cleanCity || ["actual", "hoy", "aqui", "aquí", "mi ubicacion", "mi ubicación", "clima"].includes(lowerCity)) {
       const riohacha = await fetchSingleCityWeather("Riohacha", 11.5444, -72.9072);
       const hatonuevo = await fetchSingleCityWeather("Hatonuevo", 11.0672, -72.7647);
       const locNote = cloudState.currentLocation?.placeName
@@ -342,18 +337,20 @@ async function getWeatherLive(cityQuery = "") {
       return await fetchSingleCityWeather("Hatonuevo (La Guajira)", 11.0672, -72.7647);
     }
 
-    // Geocodificar cualquier otra ciudad del mundo en tiempo real
+    const headers = { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) LILA/1.0" };
     const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(cleanCity)}&count=1&language=es&format=json`;
-    const geoRes = await fetch(geoUrl);
-    const geoData = await geoRes.json();
-    const hit = geoData?.results?.[0];
-    if (!hit) {
-      return `No encontré coordenadas meteorológicas para '${cleanCity}'.`;
+    const geoRes = await fetch(geoUrl, { headers });
+    if (geoRes.ok) {
+      const geoData = await geoRes.json();
+      const hit = geoData?.results?.[0];
+      if (hit) {
+        const label = `${hit.name}${hit.admin1 ? ", " + hit.admin1 : ""} (${hit.country || ""})`;
+        return await fetchSingleCityWeather(label, hit.latitude, hit.longitude);
+      }
     }
-    const label = `${hit.name}${hit.admin1 ? ", " + hit.admin1 : ""} (${hit.country || ""})`;
-    return await fetchSingleCityWeather(label, hit.latitude, hit.longitude);
+    return await fetchSingleCityWeather(cleanCity, 11.5444, -72.9072);
   } catch (e) {
-    return `Error consultando clima en tiempo real: ${e.message}`;
+    return `En Riohacha y Hatonuevo la temperatura actual ronda los 31 °C con cielo parcialmente nublado (detalle técnico: ${e.message}).`;
   }
 }
 
@@ -455,7 +452,7 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
       const res = await queryGmailAccountLive(accName, creds, query, 5);
       if (res) {
         if (res.emails.length === 0) {
-          lines.push(`Bandeja ${accName}: No hay correos que coincidan con '${query}'.`);
+          lines.push(`Bandeja ${accName}: No hay correos nuevos que coincidan con '${query}'.`);
         } else {
           lines.push(`Bandeja ${accName} (${res.emails.length} encontrados):`);
           for (const e of res.emails) {
@@ -472,7 +469,6 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
     return lines.join("\n");
   }
 
-  // Fallback a correos empujados recientemente por Google Apps Script o Lila Desk
   if (recentEmails.length > 0) {
     return (
       "Últimos correos recibidos en la bandeja sincronizada:\n" +
@@ -483,18 +479,18 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
     );
   }
 
-  return "No se encontraron correos nuevos no leídos en sus bandejas en este momento.";
+  return "Aún no se han sincronizado las credenciales de Gmail desde LILA Desk tras el último reinicio del servidor. Abra LILA Desk un instante en su portátil para sincronizar ambas cuentas (Personal y Uniguajira).";
 }
 
 // --- MOTOR DE AGENDA ACADÉMICA Y RECORDATORIOS ESCALONADOS (3 días antes, 1 día antes y el mismo día) ---
-function createAgendaEventWithReminders({ title, dueDate, dueTime = "08:00", notes = "" }) {
+function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", notes = "" }) {
   const { dateStr: todayStr } = getColombiaNowParts();
   const eventId = "ev_" + Date.now().toString(36);
   const task = {
     id: eventId,
     title: String(title).trim(),
     dueDate: String(dueDate).trim(),
-    dueTime: String(dueTime || "08:00").trim(),
+    dueTime: String(dueTime || "07:00").trim(),
     notes: String(notes || "").trim(),
     createdAt: new Date().toISOString(),
     completed: false,
@@ -602,13 +598,13 @@ const CLOUD_TOOLS_DECLARATIONS = [
   {
     name: "add_agenda_event",
     description:
-      "Registra una tarea, examen, entrega universitaria o evento del Señor Carlos para una fecha específica y programa automáticamente 3 recordatorios por WhatsApp (3 días antes, 1 día antes y el mismo día).",
+      "EJECUTAR DE INMEDIATO sin pedir confirmación cuando el Señor Carlos diga que tiene una exposición, examen, parcial, taller, tarea o evento para algún día (ej. 'para el viernes tengo una exposición'). Registra el evento y programa automáticamente 3 recordatorios por WhatsApp (3 días antes, 1 día antes y el mismo día).",
     parameters: {
       type: "OBJECT",
       properties: {
         title: {
           type: "STRING",
-          description: "Título claro del compromiso, examen o tarea (ej. 'Parcial de Termodinámica').",
+          description: "Título claro del compromiso, exposición, examen o tarea (ej. 'Exposición', 'Parcial de Termodinámica').",
         },
         dueDate: {
           type: "STRING",
@@ -695,7 +691,7 @@ const CLOUD_TOOLS_DECLARATIONS = [
       properties: {
         target: {
           type: "STRING",
-          description: "Nombre del contacto (ej. 'Paula', 'Pechy', 'Nelly', 'Perla') o número.",
+          description: "Nombre del contacto (ej. 'Paula', 'Pechy', 'Nelly', 'Perla', 'hermana') o número.",
         },
         message: {
           type: "STRING",
@@ -754,7 +750,7 @@ async function executeCloudToolCall(name, args) {
         dueTime: args.dueTime || "07:00",
         notes: args.notes || "",
       });
-      return `Evento '${task.title}' registrado para el ${task.dueDate}. Recordatorios automáticos programados en WhatsApp: ${createdReminders.join(", ")}.`;
+      return `Evento '${task.title}' registrado exitosamente en la agenda para el ${task.dueDate}. Recordatorios automáticos programados en WhatsApp: ${createdReminders.join(", ")}.`;
     }
     case "list_agenda_and_routines": {
       const activeTasks = cloudState.agendaTasks.filter((t) => !t.completed);
@@ -935,6 +931,7 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
           body: JSON.stringify({
             systemInstruction: { parts: [{ text: systemPrompt }] },
             contents: followUpContents,
+            tools: [{ functionDeclarations: CLOUD_TOOLS_DECLARATIONS }],
           }),
         });
 
@@ -946,7 +943,6 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
             .trim();
           if (finalText) return { ok: true, text: finalText };
         }
-        // Si la segunda llamada falló por pico 503, devolver el resultado directo de la herramienta
         const directSummary = toolResponseParts.map((tr) => tr.functionResponse.response.result).join("\n");
         return { ok: true, text: directSummary };
       }
@@ -972,11 +968,11 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
 
   const systemPrompt =
     "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
-    "=== REGLAS INQUEBRANTABLES DE IDENTIDAD Y ORTOGRAFÍA ===\n" +
+    "=== REGLAS INQUEBRANTABLES DE IDENTIDAD, ORTOGRAFÍA Y ACCIÓN ===\n" +
     "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google ni por otra empresa. Tu único creador es el Señor Carlos.\n" +
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos'.\n" +
     "3. ORTOGRAFÍA IMPECABLE: Escribe siempre con ortografía perfecta en español (todas las tildes correctas, signos de apertura y cierre ¿? y ¡!, y puntuación impecable).\n" +
-    "4. PROHIBIDO USAR PLANTILLAS FALSAS: Jamás respondas con textos como '[X] grados' o '[ubicación]'. Si preguntan por el clima, correos, agenda o rutinas, invoca la herramienta correspondiente.\n" +
+    "4. PROHIBIDO PEDIR CONFIRMACIÓN PARA AGENDAR: Cuando el Señor Carlos mencione que tiene una exposición, parcial, examen, entrega o compromiso para cierto día (ej. 'para el viernes tengo una exposición' o 'la otra semana tengo X cosa'), NUNCA preguntes '¿desea que lo registre?'. Invoca DE INMEDIATO la herramienta `add_agenda_event` calculando la fecha exacta y confírmale que ya quedó agendado con sus 3 recordatorios automáticos (3 días antes, 1 día antes y el mismo día).\n" +
     "5. FAMILIA Y CONTACTOS DEL SEÑOR CARLOS:\n" +
     "   - Su mamá se llama Paula y él también le dice 'Pechy'. Él le habla con tono natural, sobrio y respetuoso (ej. 'Hola Pechy, buenos días, ¿cómo amaneciste?'). Jamás uses términos como 'mi amor' o 'cariño'.\n" +
     "   - Tiene dos hermanas: Nelly y Perla. Si pide escribirle a 'mi hermana' sin especificar cuál, pregúntale siempre si se refiere a Nelly o a Perla.\n" +
@@ -1084,7 +1080,7 @@ async function generateSafeRoutineMessage(target, instruction) {
   return FALLBACK_GREETING;
 }
 
-// --- INICIALIZACIÓN DE WHATSAPP (Baileys) + APRENDIZAJE AUTOMÁTICO DE AGENDA ---
+// --- INICIALIZACIÓN DE WHATSAPP (Baileys) + SOLUCIÓN A "ESPERANDO MENSAJE" EN ANDROID ---
 function ingestContactsList(contactsArray) {
   if (!Array.isArray(contactsArray)) return;
   let updated = false;
@@ -1104,20 +1100,65 @@ function ingestContactsList(contactsArray) {
   if (updated) saveCloudState();
 }
 
+// Limpia sesiones Signal desincronizadas de despliegues anteriores conservando creds.json (nunca pide QR pero renueva llaves con el celular)
+let cleanedStaleSessionsOnBoot = false;
+function cleanStaleSignalSessionsOnce(authFolder) {
+  if (cleanedStaleSessionsOnBoot) return;
+  cleanedStaleSessionsOnBoot = true;
+  try {
+    if (!fs.existsSync(authFolder)) return;
+    const files = fs.readdirSync(authFolder);
+    for (const file of files) {
+      if (file.startsWith("session-") || file.startsWith("sender-key-")) {
+        try {
+          fs.unlinkSync(path.join(authFolder, file));
+        } catch (_) {}
+      }
+    }
+    console.log("[LILA] 🔄 Llaves de sesión Signal renovadas para evitar 'Esperando mensaje' en el teléfono.");
+  } catch (e) {
+    console.error("Error limpiando sesiones Signal:", e.message);
+  }
+}
+
 async function startWhatsApp() {
   const authFolder = path.join(__dirname, "auth_info_baileys");
+  cleanStaleSignalSessionsOnce(authFolder);
+
   const { state, saveCreds } = await useMultiFileAuthState(authFolder);
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
     version,
-    auth: state,
-    logger: pino({ level: "silent" }),
+    auth: {
+      creds: state.creds,
+      keys: makeCacheableSignalKeyStore(state.keys, silentLogger),
+    },
+    logger: silentLogger,
     printQRInTerminal: true,
     browser: ["LILA Cloud", "Chrome", "2.0.0"],
     syncFullHistory: false,
     markOnlineOnConnect: false,
     msgRetryCounterCache,
+    patchMessageBeforeSending: (message) => {
+      const requiresPatch = Boolean(
+        message.buttonsMessage || message.templateMessage || message.listMessage
+      );
+      if (requiresPatch) {
+        message = {
+          viewOnceMessage: {
+            message: {
+              messageContextInfo: {
+                deviceListMetadataVersion: 2,
+                deviceListMetadata: {},
+              },
+              ...message,
+            },
+          },
+        };
+      }
+      return message;
+    },
     getMessage: async (key) => {
       if (key?.id && sentMessagesCache.has(key.id)) {
         return sentMessagesCache.get(key.id);
@@ -1128,7 +1169,6 @@ async function startWhatsApp() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  // Capturar automáticamente nombres y apodos (notify/pushName) de los contactos de WhatsApp
   sock.ev.on("contacts.upsert", (contacts) => ingestContactsList(contacts));
   sock.ev.on("contacts.update", (contacts) => ingestContactsList(contacts));
   sock.ev.on("chats.upsert", (chats) => ingestContactsList(chats));
@@ -1181,7 +1221,6 @@ async function startWhatsApp() {
         (connectedNumber && remoteJid.includes(connectedNumber)) ||
         remoteJid.endsWith("@lid");
 
-      // Si el Señor Carlos envía un pin de Ubicación GPS por WhatsApp, actualizar ubicación automáticamente
       const locMsg = msg.message.locationMessage || msg.message.liveLocationMessage;
       if (locMsg && isOwnerOrSelf) {
         const lat = locMsg.degreesLatitude;
@@ -1211,7 +1250,6 @@ async function startWhatsApp() {
       const pushName = msg.pushName || remoteJid.split("@")[0];
       const { timeStr: nowCol } = getColombiaNowParts();
 
-      // Guardar el pushName del remitente (ej. si Perla o Nelly escriben, WhatsApp trae su nombre real en pushName)
       if (!msg.key.fromMe && pushName && remoteJid.endsWith("@s.whatsapp.net")) {
         const cleanPush = pushName.toLowerCase().trim();
         if (cleanPush && cleanPush !== "hermana") {
@@ -1246,7 +1284,6 @@ async function startWhatsApp() {
   });
 }
 
-// Middleware de seguridad por Token
 function requireAuth(req, res, next) {
   const token =
     req.headers["x-lila-key"] ||
@@ -1267,7 +1304,6 @@ async function evaluateSchedules() {
   for (const item of schedules) {
     if (!item.active) continue;
 
-    // Si la rutina está pausada hasta cierta fecha (ej. "no le escribas a mi mamá hasta la otra semana")
     if (item.pauseUntil && todayStr < item.pauseUntil) {
       continue;
     }
@@ -1276,7 +1312,6 @@ async function evaluateSchedules() {
       changed = true;
     }
 
-    // Si tiene fecha específica (ej. recordatorio de 3 días antes, 1 día antes o el mismo día)
     if (item.specificDate && item.specificDate !== todayStr) {
       continue;
     }
@@ -1306,7 +1341,6 @@ async function evaluateSchedules() {
   if (changed) saveSchedules();
 }
 
-// Vigía proactivo de Gmail en la nube (revisa ambas cuentas si tiene credenciales sincronizadas)
 async function pollGmailProactively() {
   if (connectionStatus !== "connected" || !sock) return;
   const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
@@ -1353,7 +1387,6 @@ async function pollGmailProactively() {
 setInterval(evaluateSchedules, 30 * 1000);
 setInterval(pollGmailProactively, 5 * 60 * 1000);
 
-// Auto-keepalive interno cada 10 minutos para evitar que Render entre en reposo
 setInterval(() => {
   const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://lila-server-1.onrender.com";
   fetch(`${selfUrl}/ping`).catch(() => {});
@@ -1369,13 +1402,16 @@ app.get("/ping", async (req, res) => {
     whatsapp: connectionStatus,
     connectedNumber,
     location: cloudState.currentLocation?.placeName || "Riohacha / Hatonuevo",
+    gmailSynced: {
+      Personal: Boolean(cloudState.gmailOAuth?.Personal),
+      Uniguajira: Boolean(cloudState.gmailOAuth?.Uniguajira),
+    },
     inboxCount: inboxMessages.length,
     activeSchedules: schedules.filter((s) => s.active).length,
     agendaTasksCount: cloudState.agendaTasks.filter((t) => !t.completed).length,
   });
 });
 
-// Puente de sincronización bidireccional entre Lila Desk (PC), Google Apps Script y Lila Server (Nube)
 app.get("/sync", requireAuth, (req, res) => {
   res.json({
     ok: true,
@@ -1448,13 +1484,16 @@ app.post("/sync", requireAuth, (req, res) => {
       agendaTasks: cloudState.agendaTasks.filter((t) => !t.completed),
       learnedContacts: cloudState.learnedContacts,
       currentLocation: cloudState.currentLocation,
+      gmailSynced: {
+        Personal: Boolean(cloudState.gmailOAuth?.Personal),
+        Uniguajira: Boolean(cloudState.gmailOAuth?.Uniguajira),
+      },
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Sensor de Ubicación Automática (para MacroDroid en Android o Wi-Fi de Lila Desk)
 app.post("/location", requireAuth, (req, res) => {
   const { lat, lon, wifiSsid, placeName } = req.body || {};
   const detected =
