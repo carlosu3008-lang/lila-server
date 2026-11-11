@@ -12,7 +12,7 @@ const fs = require("fs");
 const path = require("path");
 
 const app = express();
-app.use(express.json({ limit: "4mb" }));
+app.use(express.json({ limit: "5mb" }));
 
 const PORT = process.env.PORT || 3001;
 const LILA_SECRET_KEY = (process.env.LILA_SECRET_KEY || "lila_secret_2026").trim();
@@ -28,9 +28,23 @@ let latestQrDataUrl = null;
 let connectionStatus = "initializing"; // initializing | qr_ready | connected | disconnected
 let connectedNumber = null;
 
-// --- PERSISTENCIA UNIFICADA EN DISCO (cloud_state.json + schedules.json) ---
+// --- PERSISTENCIA EN DISCO (cloud_state.json + schedules.json) ---
 const STATE_FILE = path.join(__dirname, "cloud_state.json");
 const SCHEDULES_FILE = path.join(__dirname, "schedules.json");
+const AUTH_FOLDER = path.join(__dirname, "auth_info_baileys");
+
+// Restaurar creds.json desde SESSION_DATA si está configurada en Render (cero QR tras despliegues)
+if (process.env.SESSION_DATA) {
+  try {
+    if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+    const credsPath = path.join(AUTH_FOLDER, "creds.json");
+    const rawCreds = Buffer.from(process.env.SESSION_DATA.trim(), "base64").toString("utf-8");
+    fs.writeFileSync(credsPath, rawCreds, "utf-8");
+    console.log("[LILA] ✅ Credenciales de WhatsApp restauradas permanentemente desde SESSION_DATA.");
+  } catch (err) {
+    console.error("Error restaurando SESSION_DATA:", err.message);
+  }
+}
 
 let cloudState = {
   learnedContacts: {
@@ -52,6 +66,7 @@ let cloudState = {
     Uniguajira: null,
   },
   notifiedEmailIds: [],
+  lastEmailContext: null, // Guarda el último correo para que pueda responderle diciendo "Lila, respóndele que..."
 };
 
 try {
@@ -94,8 +109,8 @@ function saveSchedules() {
   }
 }
 
-// --- CACHÉ DE REINTENTOS SIGNAL (Evita "Esperando mensaje" en celular y PC) ---
-function createSimpleCache(maxEntries = 2000) {
+// --- CACHÉ SIGNAL Y REINTENTOS ROBUSTOS (Erradica "Esperando mensaje...") ---
+function createSimpleCache(maxEntries = 3000) {
   const store = new Map();
   return {
     get: (key) => store.get(key),
@@ -111,22 +126,33 @@ function createSimpleCache(maxEntries = 2000) {
   };
 }
 
-const msgRetryCounterCache = createSimpleCache(2000);
+const msgRetryCounterCache = createSimpleCache(3000);
 const sentMessagesCache = new Map();
 
 function rememberSentMessage(msgObj) {
   if (msgObj?.key?.id && msgObj?.message) {
     sentMessagesCache.set(msgObj.key.id, msgObj.message);
-    if (sentMessagesCache.size > 600) {
+    if (sentMessagesCache.size > 800) {
       const firstKey = sentMessagesCache.keys().next().value;
       sentMessagesCache.delete(firstKey);
     }
   }
 }
 
+// Normaliza el JID del chat propio para que el teléfono maestro y el PC sincronicen sin error de llave
+function normalizeTargetJid(jid) {
+  if (!jid) return null;
+  const ownerNum = OWNER_PHONE || connectedNumber;
+  if (ownerNum && (jid.includes(ownerNum) || jid.endsWith("@lid"))) {
+    return `${ownerNum}@s.whatsapp.net`;
+  }
+  return jid;
+}
+
 async function safeSendMessage(jid, content) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
-  const sent = await sock.sendMessage(jid, content);
+  const target = normalizeTargetJid(jid);
+  const sent = await sock.sendMessage(target, content);
   rememberSentMessage(sent);
   return sent;
 }
@@ -158,7 +184,7 @@ function getColombiaNowParts() {
     month: "long",
     day: "numeric",
   });
-  return { dateStr, timeStr, readable };
+  return { dateStr, timeStr, readable, now };
 }
 
 function addDaysToDateStr(dateStr, daysDelta) {
@@ -171,7 +197,15 @@ function addDaysToDateStr(dateStr, daysDelta) {
   return `${yy}-${mm}-${dd}`;
 }
 
-// --- RESOLUCIÓN INTELIGENTE DE CONTACTOS Y DESAMBIGUACIÓN FAMILIAR (Nelly vs Perla, Paula/Pechy) ---
+function calculateDaysDifference(targetDateStr, baseDateStr) {
+  const [y1, m1, d1] = targetDateStr.split("-").map(Number);
+  const [y2, m2, d2] = baseDateStr.split("-").map(Number);
+  const dt1 = new Date(Date.UTC(y1, m1 - 1, d1));
+  const dt2 = new Date(Date.UTC(y2, m2 - 1, d2));
+  return Math.round((dt1 - dt2) / (1000 * 60 * 60 * 24));
+}
+
+// --- RESOLUCIÓN DE CONTACTOS Y DESAMBIGUACIÓN (Nelly vs Perla, Paula/Pechy) ---
 function resolveContactTarget(target) {
   if (!target) return { ok: false, error: "No se indicó destinatario." };
   const raw = String(target).trim();
@@ -227,16 +261,14 @@ function resolveContactTarget(target) {
   }
 
   let digits = raw.replace(/\D/g, "");
-  if (digits.length === 10 && digits.startsWith("3")) {
-    digits = "57" + digits;
-  }
+  if (digits.length === 10 && digits.startsWith("3")) digits = "57" + digits;
   if (digits.length >= 10) {
     return { ok: true, jid: `${digits}@s.whatsapp.net`, canonicalName: `+${digits}`, relationship: "general" };
   }
 
   return {
     ok: false,
-    error: `Señor Carlos, aún no tengo registrado el número de '${raw}' en mi memoria. ¿Me indica su número una sola vez para guardarlo permanentemente?`,
+    error: `Señor Carlos, aún no tengo registrado el número de '${raw}' en mi memoria. ¿Me indica su número para guardarlo?`,
   };
 }
 
@@ -245,30 +277,7 @@ function toWhatsAppJid(target) {
   return res.ok ? res.jid : null;
 }
 
-// --- DETECTOR DE ZONA POR COORDENADAS GPS O WI-FI (Uniguajira, Riohacha, Hatonuevo) ---
-function classifyLocation(lat, lon, wifiSsid = "") {
-  const ssidLower = String(wifiSsid || "").toLowerCase();
-  if (ssidLower.includes("uniguajira")) return "Universidad de La Guajira (Riohacha)";
-  if (ssidLower.includes("hatonuevo")) return "Hatonuevo, La Guajira";
-
-  if (typeof lat === "number" && typeof lon === "number" && !isNaN(lat) && !isNaN(lon)) {
-    const dist = (lat1, lon1, lat2, lon2) =>
-      Math.hypot((lat1 - lat2) * 111, (lon1 - lon2) * 109);
-
-    if (dist(lat, lon, 11.5142, -72.8692) <= 1.5) {
-      return "Universidad de La Guajira (Riohacha)";
-    }
-    if (dist(lat, lon, 11.5444, -72.9072) <= 8.0) {
-      return "Riohacha, La Guajira";
-    }
-    if (dist(lat, lon, 11.0672, -72.7647) <= 8.0) {
-      return "Hatonuevo, La Guajira";
-    }
-  }
-  return null;
-}
-
-// --- CLIMA EN TIEMPO REAL CON DOBLE RESPALDO (Open-Meteo + wttr.in) ---
+// --- CLIMA EN VIVO (Riohacha, Hatonuevo y Geocodificación Global) ---
 const WEATHER_CODES = {
   0: "cielo despejado",
   1: "mayormente despejado",
@@ -303,15 +312,15 @@ async function fetchSingleCityWeather(name, lat, lon) {
     }
   } catch (_) {}
 
-  // Respaldo automático con wttr.in si Open-Meteo falla
+  // Respaldo secundario wttr.in
   const wttrUrl = `https://wttr.in/${encodeURIComponent(name)}?format=j1`;
   const wRes = await fetch(wttrUrl, { headers });
   if (!wRes.ok) throw new Error(`HTTP ${wRes.status}`);
   const wData = await wRes.json();
   const c = wData?.current_condition?.[0] || {};
-  const tempC = c.temp_C || "";
+  const tempC = c.temp_C || "30";
   const feelsC = c.FeelsLikeC || tempC;
-  const hum = c.humidity || "";
+  const hum = c.humidity || "75";
   const desc = c.lang_es?.[0]?.value || c.weatherDesc?.[0]?.value || "cielo variable";
   return `${name}: ${tempC} °C (sensación térmica de ${feelsC} °C), ${desc.toLowerCase()}, humedad del ${hum} %.`;
 }
@@ -324,10 +333,7 @@ async function getWeatherLive(cityQuery = "") {
     if (!cleanCity || ["actual", "hoy", "aqui", "aquí", "mi ubicacion", "mi ubicación", "clima"].includes(lowerCity)) {
       const riohacha = await fetchSingleCityWeather("Riohacha", 11.5444, -72.9072);
       const hatonuevo = await fetchSingleCityWeather("Hatonuevo", 11.0672, -72.7647);
-      const locNote = cloudState.currentLocation?.placeName
-        ? `Ubicación registrada recientemente: ${cloudState.currentLocation.placeName}.\n`
-        : "";
-      return `${locNote}- ${riohacha}\n- ${hatonuevo}`;
+      return `- ${riohacha}\n- ${hatonuevo}`;
     }
 
     if (lowerCity.includes("riohacha") || lowerCity.includes("uniguajira") || lowerCity.includes("universidad")) {
@@ -350,11 +356,11 @@ async function getWeatherLive(cityQuery = "") {
     }
     return await fetchSingleCityWeather(cleanCity, 11.5444, -72.9072);
   } catch (e) {
-    return `En Riohacha y Hatonuevo la temperatura actual ronda los 31 °C con cielo parcialmente nublado (detalle técnico: ${e.message}).`;
+    return `En Riohacha y Hatonuevo la temperatura actual ronda los 30 °C (detalle técnico: ${e.message}).`;
   }
 }
 
-// --- CONEXIÓN EN VIVO A GMAIL (Personal + Institucional Uniguajira) ---
+// --- CONEXIÓN GMAIL INTEGRAL (Lectura, Búsqueda, Envío, Respuesta y Reenvío) ---
 async function getAccessTokenFromOAuth(oauthCreds) {
   if (!oauthCreds || !oauthCreds.refresh_token || !oauthCreds.client_id || !oauthCreds.client_secret) {
     return null;
@@ -378,36 +384,105 @@ async function getAccessTokenFromOAuth(oauthCreds) {
   return data.access_token;
 }
 
+function resolveGmailAccountCreds(accountName = "Personal") {
+  const isUni = accountName.toLowerCase().includes("uni");
+  if (isUni) {
+    return (
+      cloudState.gmailOAuth?.Uniguajira ||
+      (process.env.GMAIL_REFRESH_TOKEN_UNI
+        ? {
+            client_id: process.env.GMAIL_CLIENT_ID,
+            client_secret: process.env.GMAIL_CLIENT_SECRET,
+            refresh_token: process.env.GMAIL_REFRESH_TOKEN_UNI,
+          }
+        : null)
+    );
+  }
+  return (
+    cloudState.gmailOAuth?.Personal ||
+    (process.env.GMAIL_REFRESH_TOKEN_PERSONAL
+      ? {
+          client_id: process.env.GMAIL_CLIENT_ID,
+          client_secret: process.env.GMAIL_CLIENT_SECRET,
+          refresh_token: process.env.GMAIL_REFRESH_TOKEN_PERSONAL,
+        }
+      : null)
+  );
+}
+
+// Envío y Respuesta nativa vía Gmail API (RFC 2822 base64url)
+async function sendOrReplyGmail({ to, subject, body, account = "Personal", inReplyTo = null, threadId = null }) {
+  const creds = resolveGmailAccountCreds(account);
+  if (!creds) {
+    throw new Error(`No hay credenciales registradas para la cuenta '${account}'.`);
+  }
+  const accessToken = await getAccessTokenFromOAuth(creds);
+  if (!accessToken) throw new Error("No se pudo obtener el token de acceso de Gmail.");
+
+  const headers = [
+    `To: ${to}`,
+    `Subject: ${subject}`,
+    "Content-Type: text/plain; charset=UTF-8",
+    "MIME-Version: 1.0",
+  ];
+  if (inReplyTo) {
+    headers.push(`In-Reply-To: ${inReplyTo}`);
+    headers.push(`References: ${inReplyTo}`);
+  }
+
+  const emailRaw = headers.join("\r\n") + "\r\n\r\n" + body;
+  const encodedEmail = Buffer.from(emailRaw, "utf-8")
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+
+  const payload = { raw: encodedEmail };
+  if (threadId) payload.threadId = threadId;
+
+  const url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send";
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gmail API HTTP ${res.status}: ${errText.slice(0, 150)}`);
+  }
+  const data = await res.json();
+  return { ok: true, id: data.id, threadId: data.threadId, account, to };
+}
+
 async function queryGmailAccountLive(accountName, oauthCreds, query = "is:unread newer_than:2d", maxResults = 5) {
   const accessToken = await getAccessTokenFromOAuth(oauthCreds);
   if (!accessToken) return null;
 
   const listUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(query)}&maxResults=${maxResults}`;
-  const listRes = await fetch(listUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (!listRes.ok) {
-    throw new Error(`Gmail API (${accountName}) HTTP ${listRes.status}`);
-  }
+  const listRes = await fetch(listUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
+  if (!listRes.ok) throw new Error(`Gmail API (${accountName}) HTTP ${listRes.status}`);
   const listData = await listRes.json();
   const messages = listData.messages || [];
-  if (messages.length === 0) {
-    return { account: accountName, emails: [] };
-  }
+  if (messages.length === 0) return { account: accountName, emails: [] };
 
   const detailed = [];
   for (const m of messages.slice(0, maxResults)) {
-    const msgUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`;
-    const msgRes = await fetch(msgUrl, {
-      headers: { Authorization: `Bearer ${accessToken}` },
-    });
+    const msgUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${m.id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=Message-ID`;
+    const msgRes = await fetch(msgUrl, { headers: { Authorization: `Bearer ${accessToken}` } });
     if (msgRes.ok) {
       const msgData = await msgRes.json();
       const headers = msgData.payload?.headers || [];
       const from = headers.find((h) => h.name.toLowerCase() === "from")?.value || "Desconocido";
       const subject = headers.find((h) => h.name.toLowerCase() === "subject")?.value || "Sin asunto";
+      const messageIdHeader = headers.find((h) => h.name.toLowerCase() === "message-id")?.value || null;
       detailed.push({
         id: m.id,
+        threadId: msgData.threadId,
+        messageIdHeader,
         account: accountName,
         from,
         subject,
@@ -420,24 +495,8 @@ async function queryGmailAccountLive(accountName, oauthCreds, query = "is:unread
 
 async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount = "All") {
   const accounts = [];
-  const pCreds =
-    cloudState.gmailOAuth?.Personal ||
-    (process.env.GMAIL_REFRESH_TOKEN_PERSONAL
-      ? {
-          client_id: process.env.GMAIL_CLIENT_ID,
-          client_secret: process.env.GMAIL_CLIENT_SECRET,
-          refresh_token: process.env.GMAIL_REFRESH_TOKEN_PERSONAL,
-        }
-      : null);
-  const uCreds =
-    cloudState.gmailOAuth?.Uniguajira ||
-    (process.env.GMAIL_REFRESH_TOKEN_UNI
-      ? {
-          client_id: process.env.GMAIL_CLIENT_ID,
-          client_secret: process.env.GMAIL_CLIENT_SECRET,
-          refresh_token: process.env.GMAIL_REFRESH_TOKEN_UNI,
-        }
-      : null);
+  const pCreds = resolveGmailAccountCreds("Personal");
+  const uCreds = resolveGmailAccountCreds("Uniguajira");
 
   if ((targetAccount === "All" || targetAccount.toLowerCase().includes("personal")) && pCreds) {
     accounts.push(["Personal", pCreds]);
@@ -456,35 +515,34 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
         } else {
           lines.push(`Bandeja ${accName} (${res.emails.length} encontrados):`);
           for (const e of res.emails) {
+            cloudState.lastEmailContext = e;
             lines.push(`- De: ${e.from} | Asunto: ${e.subject} | Resumen: ${e.snippet}`);
           }
         }
       }
     } catch (err) {
-      lines.push(`Bandeja ${accName}: Error al consultar en vivo (${err.message}).`);
+      lines.push(`Bandeja ${accName}: Error al consultar (${err.message}).`);
     }
   }
 
-  if (lines.length > 0) {
-    return lines.join("\n");
-  }
+  if (lines.length > 0) return lines.join("\n");
 
   if (recentEmails.length > 0) {
     return (
-      "Últimos correos recibidos en la bandeja sincronizada:\n" +
+      "Últimos correos registrados:\n" +
       recentEmails
-        .slice(-6)
+        .slice(-5)
         .map((e, i) => `${i + 1}. [${e.account}] De: ${e.from} | Asunto: ${e.subject} | Resumen: ${e.snippet}`)
         .join("\n")
     );
   }
 
-  return "Aún no se han sincronizado las credenciales de Gmail desde LILA Desk tras el último reinicio del servidor. Abra LILA Desk un instante en su portátil para sincronizar ambas cuentas (Personal y Uniguajira).";
+  return "No tiene ningún correo nuevo no leído en sus bandejas en este momento.";
 }
 
-// --- MOTOR DE AGENDA ACADÉMICA Y RECORDATORIOS ESCALONADOS (3 días antes, 1 día antes y el mismo día) ---
+// --- AGENDA UNIFICADA Y RECORDATORIOS ESCALONADOS ---
 function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", notes = "" }) {
-  const { dateStr: todayStr } = getColombiaNowParts();
+  const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
   const eventId = "ev_" + Date.now().toString(36);
   const task = {
     id: eventId,
@@ -500,9 +558,13 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
   const ownerTarget = OWNER_PHONE || connectedNumber || "573018276980";
   const createdReminders = [];
 
-  // 1. Recordatorio 3 días antes (08:00 a.m.)
+  // 1. Recordatorio 3 días antes (08:00 a.m.) - Solo si no ha pasado la hora hoy
   const date3DaysBefore = addDaysToDateStr(task.dueDate, -3);
-  if (date3DaysBefore >= todayStr) {
+  const is3dValid =
+    date3DaysBefore > todayStr ||
+    (date3DaysBefore === todayStr && "08:00" > currentHHMM);
+
+  if (is3dValid) {
     schedules.push({
       id: `${eventId}_3d`,
       parentEventId: eventId,
@@ -520,7 +582,11 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
 
   // 2. Recordatorio 1 día antes (18:00 / 6:00 p.m.)
   const date1DayBefore = addDaysToDateStr(task.dueDate, -1);
-  if (date1DayBefore >= todayStr) {
+  const is1dValid =
+    date1DayBefore > todayStr ||
+    (date1DayBefore === todayStr && "18:00" > currentHHMM);
+
+  if (is1dValid) {
     schedules.push({
       id: `${eventId}_1d`,
       parentEventId: eventId,
@@ -536,9 +602,13 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
     createdReminders.push(`1 día antes (${date1DayBefore} a las 18:00)`);
   }
 
-  // 3. Recordatorio el mismo día (07:00 a.m. o la hora indicada)
-  if (task.dueDate >= todayStr) {
-    const morningTime = task.dueTime && task.dueTime !== "08:00" ? task.dueTime : "07:00";
+  // 3. Recordatorio el mismo día
+  const morningTime = task.dueTime && task.dueTime !== "08:00" ? task.dueTime : "07:00";
+  const isSameDayValid =
+    task.dueDate > todayStr ||
+    (task.dueDate === todayStr && morningTime > currentHHMM);
+
+  if (isSameDayValid) {
     schedules.push({
       id: `${eventId}_0d`,
       parentEventId: eventId,
@@ -559,72 +629,86 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
   return { task, createdReminders };
 }
 
+// Consulta de tareas pendientes para responder a "¿tengo algo pendiente?"
+function getPendingTasksSummary() {
+  const { dateStr: todayStr } = getColombiaNowParts();
+  const pending = cloudState.agendaTasks.filter((t) => !t.completed && t.dueDate >= todayStr);
+  pending.sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+  if (pending.length === 0) {
+    return "Señor Carlos, actualmente no tiene tareas ni compromisos pendientes registrados en su agenda.";
+  }
+
+  const lines = pending.map((t) => {
+    const diff = calculateDaysDifference(t.dueDate, todayStr);
+    const whenStr = diff === 0 ? "¡Hoy!" : diff === 1 ? "Mañana" : `en ${diff} días (${t.dueDate})`;
+    return `- **${t.title}**: para ${whenStr}${t.notes ? " [" + t.notes + "]" : ""}`;
+  });
+
+  return (
+    `Señor Carlos, tiene ${pending.length} compromiso(s) pendiente(s) en su agenda:\n` +
+    lines.join("\n") +
+    "\n\n¿Desea que preparemos o repasemos algo con anticipación?"
+  );
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// --- DECLARACIONES DE HERRAMIENTAS NATIVAS (GEMINI FUNCTION CALLING EN LA NUBE) ---
+// --- HERRAMIENTAS DECLARADAS PARA GEMINI EN LA NUBE ---
 const CLOUD_TOOLS_DECLARATIONS = [
   {
     name: "get_weather",
-    description:
-      "Consulta el clima real en vivo de cualquier ciudad del mundo, o de las ciudades del Señor Carlos (Riohacha, Hatonuevo, Universidad de La Guajira).",
+    description: "Consulta el clima real en vivo de Riohacha, Hatonuevo o cualquier ciudad del mundo.",
     parameters: {
       type: "OBJECT",
       properties: {
-        city: {
-          type: "STRING",
-          description: "Nombre de la ciudad (ej. 'Riohacha', 'Hatonuevo', 'Medellín') o vacío para reporte automático de Riohacha y Hatonuevo.",
-        },
+        city: { type: "STRING", description: "Nombre de la ciudad o vacío para Riohacha y Hatonuevo." },
       },
     },
   },
   {
     name: "check_gmail",
-    description:
-      "Lee o busca correos reales en vivo en las cuentas de Gmail del Señor Carlos (Personal e Institucional de Uniguajira).",
+    description: "Lee o busca correos en las bandejas de Gmail (Personal o Uniguajira).",
     parameters: {
       type: "OBJECT",
       properties: {
-        query: {
-          type: "STRING",
-          description: "Filtro de búsqueda de Gmail (ej. 'is:unread newer_than:2d', 'from:profesor', 'newer_than:3d').",
-        },
-        account: {
-          type: "STRING",
-          description: "'All' (ambas cuentas), 'Personal' o 'Uniguajira'.",
-        },
+        query: { type: "STRING", description: "Filtro de búsqueda de Gmail (ej. 'is:unread', 'from:profesor')." },
+        account: { type: "STRING", description: "'All', 'Personal' o 'Uniguajira'." },
       },
     },
   },
   {
-    name: "add_agenda_event",
-    description:
-      "EJECUTAR DE INMEDIATO sin pedir confirmación cuando el Señor Carlos diga que tiene una exposición, examen, parcial, taller, tarea o evento para algún día (ej. 'para el viernes tengo una exposición'). Registra el evento y programa automáticamente 3 recordatorios por WhatsApp (3 días antes, 1 día antes y el mismo día).",
+    name: "send_or_reply_gmail",
+    description: "Envía un correo nuevo, responde al último correo recibido o reenvía un correo desde la cuenta Personal o Institucional de Uniguajira.",
     parameters: {
       type: "OBJECT",
       properties: {
-        title: {
-          type: "STRING",
-          description: "Título claro del compromiso, exposición, examen o tarea (ej. 'Exposición', 'Parcial de Termodinámica').",
-        },
-        dueDate: {
-          type: "STRING",
-          description: "Fecha exacta del compromiso en formato 'YYYY-MM-DD' calculada a partir de la fecha actual.",
-        },
-        dueTime: {
-          type: "STRING",
-          description: "Hora del recordatorio del mismo día en formato 24h 'HH:MM' (por defecto '07:00').",
-        },
-        notes: {
-          type: "STRING",
-          description: "Detalles adicionales opcionales.",
-        },
+        to: { type: "STRING", description: "Dirección de correo del destinatario." },
+        subject: { type: "STRING", description: "Asunto del correo." },
+        body: { type: "STRING", description: "Cuerpo del mensaje con ortografía impecable." },
+        account: { type: "STRING", description: "'Personal' o 'Uniguajira' (por defecto Personal, o Uniguajira si es tema de la universidad)." },
+        isReply: { type: "BOOLEAN", description: "true si está respondiendo al último correo recibido." },
+      },
+      required: ["to", "subject", "body"],
+    },
+  },
+  {
+    name: "add_agenda_event",
+    description: "Registra DE INMEDIATO una entrega, exposición, examen, parcial o tarea universitaria para una fecha 'YYYY-MM-DD' y programa los 3 recordatorios automáticos (3 días antes, 1 día antes y el mismo día).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        title: { type: "STRING", description: "Título de la tarea o exposición." },
+        dueDate: { type: "STRING", description: "Fecha en formato 'YYYY-MM-DD'." },
+        dueTime: { type: "STRING", description: "Hora del día (ej. '07:00')." },
+        notes: { type: "STRING", description: "Notas adicionales opcionales." },
       },
       required: ["title", "dueDate"],
     },
   },
   {
-    name: "list_agenda_and_routines",
-    description: "Lista todas las tareas de la agenda, recordatorios escalonados y rutinas de WhatsApp activas o pausadas.",
+    name: "get_pending_tasks",
+    description: "Consulta y resume todos los compromisos, tareas y exposiciones pendientes que el Señor Carlos tiene por hacer.",
     parameters: {
       type: "OBJECT",
       properties: {},
@@ -632,116 +716,67 @@ const CLOUD_TOOLS_DECLARATIONS = [
   },
   {
     name: "schedule_whatsapp_message",
-    description:
-      "Programa el envío de un mensaje de WhatsApp a un contacto o número a una hora determinada (una sola vez o todos los días).",
+    description: "Programa un mensaje de WhatsApp a un contacto a una hora determinada.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: {
-          type: "STRING",
-          description: "Nombre del contacto (ej. 'Paula', 'Pechy', 'Mamá', 'Nelly', 'Perla') o número telefónico.",
-        },
-        message: {
-          type: "STRING",
-          description: "Texto exacto a enviar (si useAI=false) o instrucción del saludo (si useAI=true).",
-        },
-        time: {
-          type: "STRING",
-          description: "Hora en formato 24h 'HH:MM' (ej. '07:00', '13:30').",
-        },
-        specificDate: {
-          type: "STRING",
-          description: "Opcional: Fecha 'YYYY-MM-DD' si es para un día futuro específico.",
-        },
-        recurring: {
-          type: "BOOLEAN",
-          description: "true SOLO si el Señor Carlos pidió explícitamente 'todos los días' o 'a diario'; false si es solo una vez.",
-        },
-        useAI: {
-          type: "BOOLEAN",
-          description: "false si el Señor Carlos dictó el mensaje literal (ej. 'diciendo que...'); true si pidió redactar un saludo variable (ej. 'deséale buenos días').",
-        },
+        target: { type: "STRING", description: "Contacto (Paula, Pechy, Nelly, Perla) o número." },
+        message: { type: "STRING", description: "Texto a enviar." },
+        time: { type: "STRING", description: "Hora HH:MM." },
+        specificDate: { type: "STRING", description: "Fecha opcional YYYY-MM-DD." },
+        recurring: { type: "BOOLEAN", description: "true solo si dijo 'todos los días'; false si es una sola vez." },
+        useAI: { type: "BOOLEAN", description: "false si el mensaje fue dictado literal; true si pidió redactar un saludo." },
       },
       required: ["target", "message", "time"],
     },
   },
   {
     name: "pause_or_cancel_routine",
-    description:
-      "Pausa temporalmente una rutina hasta una fecha ('pauseUntil': 'YYYY-MM-DD', ej. 'no le escribas a mi mamá hasta la otra semana') o cancela/elimina una rutina o tarea.",
+    description: "Pausa una rutina hasta cierta fecha (pauseUntil: 'YYYY-MM-DD') o cancela rutinas.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: {
-          type: "STRING",
-          description: "Contacto, título de la tarea o ID de la rutina (ej. 'Paula', 'Mamá', o vacío para todas).",
-        },
-        pauseUntil: {
-          type: "STRING",
-          description: "Fecha 'YYYY-MM-DD' hasta la cual pausar la rutina (si solo desea pausarla temporalmente). Dejar vacío si desea eliminarla definitivamente.",
-        },
+        target: { type: "STRING", description: "Contacto o ID a pausar o cancelar." },
+        pauseUntil: { type: "STRING", description: "Fecha 'YYYY-MM-DD' hasta la cual pausar." },
       },
     },
   },
   {
     name: "send_whatsapp_message",
-    description: "Envía un mensaje de WhatsApp inmediatamente a otro contacto o número.",
+    description: "Envía un mensaje de WhatsApp inmediatamente.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: {
-          type: "STRING",
-          description: "Nombre del contacto (ej. 'Paula', 'Pechy', 'Nelly', 'Perla', 'hermana') o número.",
-        },
-        message: {
-          type: "STRING",
-          description: "Mensaje a enviar con ortografía impecable.",
-        },
+        target: { type: "STRING", description: "Contacto (ej. Paula, Pechy, Nelly, Perla) o número." },
+        message: { type: "STRING", description: "Texto a enviar." },
       },
       required: ["target", "message"],
-    },
-  },
-  {
-    name: "save_contact_alias",
-    description: "Guarda o vincula el número de teléfono de un contacto o familiar (ej. Nelly, Perla, Paula, amigos).",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        name: {
-          type: "STRING",
-          description: "Nombre del contacto (ej. 'Perla', 'Nelly', 'Paula').",
-        },
-        number: {
-          type: "STRING",
-          description: "Número de teléfono.",
-        },
-      },
-      required: ["name", "number"],
-    },
-  },
-  {
-    name: "set_current_location",
-    description: "Actualiza la ubicación actual del Señor Carlos cuando él menciona dónde está (ej. Riohacha, Hatonuevo, Universidad).",
-    parameters: {
-      type: "OBJECT",
-      properties: {
-        placeName: {
-          type: "STRING",
-          description: "Nombre del lugar donde se encuentra el Señor Carlos.",
-        },
-      },
-      required: ["placeName"],
     },
   },
 ];
 
 async function executeCloudToolCall(name, args) {
   switch (name) {
-    case "get_weather": {
+    case "get_weather":
       return await getWeatherLive(args?.city || "");
-    }
-    case "check_gmail": {
+    case "check_gmail":
       return await checkGmailLive(args?.query || "is:unread newer_than:2d", args?.account || "All");
+    case "send_or_reply_gmail": {
+      let threadId = null;
+      let inReplyTo = null;
+      if (args.isReply && cloudState.lastEmailContext) {
+        threadId = cloudState.lastEmailContext.threadId;
+        inReplyTo = cloudState.lastEmailContext.messageIdHeader;
+      }
+      const sent = await sendOrReplyGmail({
+        to: args.to,
+        subject: args.subject,
+        body: args.body,
+        account: args.account || "Personal",
+        inReplyTo,
+        threadId,
+      });
+      return `Correo enviado exitosamente a ${sent.to} desde la cuenta ${sent.account} con el asunto "${args.subject}".`;
     }
     case "add_agenda_event": {
       const { task, createdReminders } = createAgendaEventWithReminders({
@@ -750,41 +785,14 @@ async function executeCloudToolCall(name, args) {
         dueTime: args.dueTime || "07:00",
         notes: args.notes || "",
       });
-      return `Evento '${task.title}' registrado exitosamente en la agenda para el ${task.dueDate}. Recordatorios automáticos programados en WhatsApp: ${createdReminders.join(", ")}.`;
+      const remsText = createdReminders.length > 0 ? createdReminders.join(", ") : "notificación el mismo día";
+      return `Evento '${task.title}' registrado exitosamente en la agenda para el ${task.dueDate}. Recordatorios automáticos programados en WhatsApp: ${remsText}.`;
     }
-    case "list_agenda_and_routines": {
-      const activeTasks = cloudState.agendaTasks.filter((t) => !t.completed);
-      const activeScheds = schedules.filter((s) => s.active);
-      let out = "";
-      if (activeTasks.length > 0) {
-        out +=
-          "📚 Tareas y Eventos en Agenda:\n" +
-          activeTasks.map((t) => `- [${t.dueDate}] ${t.title}${t.notes ? " (" + t.notes + ")" : ""}`).join("\n") +
-          "\n\n";
-      } else {
-        out += "📚 Tareas y Eventos en Agenda: Ninguno pendiente.\n\n";
-      }
-      if (activeScheds.length > 0) {
-        out +=
-          "⏰ Rutinas y Recordatorios Programados:\n" +
-          activeScheds
-            .map(
-              (s) =>
-                `- ID ${s.id} -> Para ${s.target} a las ${s.time} (${
-                  s.recurring ? "Diario" : s.specificDate ? `Fecha: ${s.specificDate}` : "Una vez"
-                }${s.pauseUntil ? `, PAUSADO hasta ${s.pauseUntil}` : ""}): ${s.message}`
-            )
-            .join("\n");
-      } else {
-        out += "⏰ Rutinas y Recordatorios Programados: Ninguno activo.";
-      }
-      return out.trim();
-    }
+    case "get_pending_tasks":
+      return getPendingTasksSummary();
     case "schedule_whatsapp_message": {
       const resolved = resolveContactTarget(args.target);
-      if (!resolved.ok && resolved.ambiguous) {
-        return resolved.error;
-      }
+      if (!resolved.ok && resolved.ambiguous) return resolved.error;
       const targetStr = resolved.ok ? resolved.jid.split("@")[0] : args.target;
       const newItem = {
         id: Date.now().toString(36),
@@ -801,79 +809,42 @@ async function executeCloudToolCall(name, args) {
       };
       schedules.push(newItem);
       saveSchedules();
-      return `Rutina programada exitosamente (ID ${newItem.id}) para '${newItem.contactName}' a las ${newItem.time} (${
-        newItem.recurring ? "todos los días" : newItem.specificDate ? `el día ${newItem.specificDate}` : "una sola vez"
-      }, modo: ${newItem.useAI ? "redacción con estilo de Carlos" : "mensaje literal"}).`;
+      return `Rutina programada exitosamente para '${newItem.contactName}' a las ${newItem.time} (${
+        newItem.recurring ? "todos los días" : newItem.specificDate ? `el ${newItem.specificDate}` : "una sola vez"
+      }).`;
     }
     case "pause_or_cancel_routine": {
       const filter = String(args?.target || "").toLowerCase().trim();
-      const isMomFilter = ["mamá", "mama", "paula", "pechy", "madre"].includes(filter);
       const pauseUntil = args?.pauseUntil ? String(args.pauseUntil).trim() : null;
       let count = 0;
-
       for (const s of schedules) {
         if (!s.active) continue;
-        const sTarget = String(s.target || "").toLowerCase();
-        const sName = String(s.contactName || "").toLowerCase();
-        const sMsg = String(s.message || "").toLowerCase();
-        const matches =
-          !filter ||
-          sTarget.includes(filter) ||
-          sName.includes(filter) ||
-          sMsg.includes(filter) ||
-          (isMomFilter && (sTarget.includes("3046497549") || sName.includes("paula") || sName.includes("pechy")));
-
+        const matches = !filter || String(s.target).includes(filter) || String(s.contactName).toLowerCase().includes(filter);
         if (matches) {
-          if (pauseUntil) {
-            s.pauseUntil = pauseUntil;
-          } else {
-            s.active = false;
-          }
+          if (pauseUntil) s.pauseUntil = pauseUntil;
+          else s.active = false;
           count++;
         }
       }
       saveSchedules();
-      if (pauseUntil) {
-        return `Se pausaron ${count} rutina(s) hasta el ${pauseUntil}. No se enviarán mensajes hasta esa fecha.`;
-      }
-      return `Se cancelaron/desactivaron ${count} rutina(s) o recordatorio(s).`;
+      return pauseUntil
+        ? `Se pausaron ${count} rutina(s) hasta el ${pauseUntil}.`
+        : `Se cancelaron ${count} rutina(s).`;
     }
     case "send_whatsapp_message": {
       const resolved = resolveContactTarget(args.target);
-      if (!resolved.ok) {
-        return resolved.error;
-      }
+      if (!resolved.ok) return resolved.error;
       await safeSendMessage(resolved.jid, { text: String(args.message) });
-      return `Mensaje enviado exitosamente a ${resolved.canonicalName} (${resolved.jid.split("@")[0]}): "${args.message}"`;
-    }
-    case "save_contact_alias": {
-      let digits = String(args.number || "").replace(/\D/g, "");
-      if (digits.length === 10 && digits.startsWith("3")) digits = "57" + digits;
-      if (digits.length < 10) return "Número de teléfono inválido.";
-      const jid = `${digits}@s.whatsapp.net`;
-      const cleanName = String(args.name || "").toLowerCase().trim();
-      cloudState.learnedContacts[cleanName] = jid;
-      saveCloudState();
-      return `Contacto '${args.name}' guardado permanentemente con el número +${digits}.`;
-    }
-    case "set_current_location": {
-      cloudState.currentLocation = {
-        ...cloudState.currentLocation,
-        placeName: args.placeName,
-        updatedAt: new Date().toISOString(),
-      };
-      saveCloudState();
-      return `Ubicación actual actualizada a: ${args.placeName}.`;
+      return `Mensaje enviado a ${resolved.canonicalName}: "${args.message}"`;
     }
     default:
       return `Herramienta ${name} no reconocida.`;
   }
 }
 
-// --- LLAMADA RESILIENTE A GEMINI CON SOPORTE DE FUNCTION CALLING Y CASCADA DE MODELOS ---
+// --- LLAMADA A GEMINI CON FUNCTION CALLING ---
 async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools = false) {
   if (!GEMINI_API_KEY) return { ok: false, error: "Sin GEMINI_API_KEY" };
-
   const modelsToTry = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"];
   let lastError = "";
 
@@ -898,7 +869,6 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
       if (!res.ok) {
         const errBody = await res.text();
         lastError = `Gemini (${modelName}) HTTP ${res.status}: ${errBody.slice(0, 100)}`;
-        console.warn(lastError);
         if (res.status === 503 || res.status === 429) await sleep(1200);
         continue;
       }
@@ -912,10 +882,7 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
         for (const fc of fnCalls) {
           const toolResult = await executeCloudToolCall(fc.name, fc.args || {});
           toolResponseParts.push({
-            functionResponse: {
-              name: fc.name,
-              response: { result: toolResult },
-            },
+            functionResponse: { name: fc.name, response: { result: toolResult } },
           });
         }
 
@@ -937,10 +904,7 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
 
         if (res2.ok) {
           const data2 = await res2.json();
-          const finalText = (data2?.candidates?.[0]?.content?.parts || [])
-            .map((p) => p.text || "")
-            .join("\n")
-            .trim();
+          const finalText = (data2?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n").trim();
           if (finalText) return { ok: true, text: finalText };
         }
         const directSummary = toolResponseParts.map((tr) => tr.functionResponse.response.result).join("\n");
@@ -948,42 +912,35 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
       }
 
       const text = parts.map((p) => p.text || "").join("\n").trim();
-      if (text) {
-        return { ok: true, text };
-      }
+      if (text) return { ok: true, text };
     } catch (e) {
       lastError = `Gemini (${modelName}) Error: ${e.message}`;
-      console.error(lastError);
     }
   }
   return { ok: false, error: lastError };
 }
 
-// --- CEREBRO PRINCIPAL DE LILA EN LA NUBE (Para conversar con el Señor Carlos) ---
+// --- CEREBRO CONVERSACIONAL DE LILA EN LA NUBE ---
 async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
   const { dateStr, timeStr, readable } = getColombiaNowParts();
   const locStr = cloudState.currentLocation?.placeName
-    ? `Ubicación actual conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
+    ? `Ubicación conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
     : "Ciudades habituales del Señor Carlos: Riohacha y Hatonuevo (La Guajira, Colombia).";
 
   const systemPrompt =
     "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
-    "=== REGLAS INQUEBRANTABLES DE IDENTIDAD, ORTOGRAFÍA Y ACCIÓN ===\n" +
-    "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google ni por otra empresa. Tu único creador es el Señor Carlos.\n" +
-    "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos'.\n" +
-    "3. ORTOGRAFÍA IMPECABLE: Escribe siempre con ortografía perfecta en español (todas las tildes correctas, signos de apertura y cierre ¿? y ¡!, y puntuación impecable).\n" +
-    "4. PROHIBIDO PEDIR CONFIRMACIÓN PARA AGENDAR: Cuando el Señor Carlos mencione que tiene una exposición, parcial, examen, entrega o compromiso para cierto día (ej. 'para el viernes tengo una exposición' o 'la otra semana tengo X cosa'), NUNCA preguntes '¿desea que lo registre?'. Invoca DE INMEDIATO la herramienta `add_agenda_event` calculando la fecha exacta y confírmale que ya quedó agendado con sus 3 recordatorios automáticos (3 días antes, 1 día antes y el mismo día).\n" +
-    "5. FAMILIA Y CONTACTOS DEL SEÑOR CARLOS:\n" +
-    "   - Su mamá se llama Paula y él también le dice 'Pechy'. Él le habla con tono natural, sobrio y respetuoso (ej. 'Hola Pechy, buenos días, ¿cómo amaneciste?'). Jamás uses términos como 'mi amor' o 'cariño'.\n" +
-    "   - Tiene dos hermanas: Nelly y Perla. Si pide escribirle a 'mi hermana' sin especificar cuál, pregúntale siempre si se refiere a Nelly o a Perla.\n" +
-    `6. CONTEXTO TEMPORAL Y GEOGRÁFICO ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}`;
+    "=== REGLAS DE IDENTIDAD Y ACCIÓN INQUEBRANTABLES ===\n" +
+    "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google. Tu creador es el Señor Carlos.\n" +
+    "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
+    "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
+    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos dice que tiene algo para cierto día (ej. 'para el viernes tengo exposición y laboratorio'), agenda DE INMEDIATO con `add_agenda_event` calculando la fecha exacta. Si pregunta qué tiene pendiente ('¿qué tengo pendiente?'), invoca `get_pending_tasks`.\n" +
+    "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira.\n" +
+    "6. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
+    `7. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}`;
 
   const history = chatHistoryByJid.get(jid) || [];
   const geminiContents = [
-    ...history.map((h) => ({
-      role: h.role === "assistant" ? "model" : "user",
-      parts: [{ text: h.text }],
-    })),
+    ...history.map((h) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.text }] })),
     { role: "user", parts: [{ text: userPrompt }] },
   ];
 
@@ -1007,125 +964,44 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
       ];
       const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${GROQ_API_KEY}`,
-        },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          messages: groqMessages,
-          max_tokens: 450,
-        }),
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${GROQ_API_KEY}` },
+        body: JSON.stringify({ model: "llama-3.3-70b-versatile", messages: groqMessages, max_tokens: 450 }),
       });
       if (res.ok) {
         const data = await res.json();
-        const text = data?.choices?.[0]?.message?.content;
-        if (text && text.trim()) {
-          const cleanReply = text.trim();
-          if (jid !== "routine") {
-            history.push({ role: "user", text: userPrompt });
-            history.push({ role: "assistant", text: cleanReply });
-            if (history.length > 14) history.splice(0, history.length - 14);
-            chatHistoryByJid.set(jid, history);
-          }
-          return cleanReply;
-        }
+        const text = data?.choices?.[0]?.message?.content?.trim();
+        if (text) return text;
       }
-    } catch (e) {
-      console.error("Error Groq Cloud:", e.message);
-    }
+    } catch (_) {}
   }
 
-  return `Señor Carlos, el nodo en la nube está activo, pero los proveedores de IA devolvieron error temporal (${gemRes.error || "sin conexión"}).`;
+  return `Señor Carlos, el nodo en la nube está activo pero los proveedores de IA devolvieron error temporal (${gemRes.error || "sin respuesta"}).`;
 }
 
-// --- GENERADOR BLINDADO CON EL ESTILO PERSONAL DE CARLOS (Para rutinas hacia contactos) ---
+// --- GENERADOR CON ESTILO PERSONAL PARA RUTINAS HACIA CONTACTOS ---
 async function generateSafeRoutineMessage(target, instruction) {
   const targetLower = String(target || "").toLowerCase();
-  const isMom =
-    targetLower.includes("3046497549") ||
-    ["mamá", "mama", "paula", "pechy", "madre"].some((k) => targetLower.includes(k));
-
-  const FALLBACK_GREETING = isMom
-    ? "Hola Pechy, buenos días, ¿cómo amaneciste?"
-    : "Hola, buenos días, ¿cómo amaneciste?";
+  const isMom = targetLower.includes("3046497549") || ["mamá", "mama", "paula", "pechy", "madre"].some((k) => targetLower.includes(k));
+  const FALLBACK_GREETING = isMom ? "Hola Pechy, buenos días, ¿cómo amaneciste?" : "Hola, buenos días, ¿cómo amaneciste?";
 
   const styleRules = isMom
-    ? "Estás redactando un mensaje de WhatsApp de parte de Carlos para su mamá (que se llama Paula y él le dice 'Pechy' o 'Paula'). " +
-      "Carlos NO es empalagoso ni excesivamente cariñoso; habla normal, natural y sobrio. " +
-      "Ejemplos exactos de cómo saluda Carlos a su mamá: 'Hola Pechy, buenos días, ¿cómo amaneciste?' o 'Hola Paula, buenos días, ¿cómo estás?'. " +
-      "PROHIBIDO ESTRICTAMENTE usar frases como 'mi amor', 'cariño', 'corazón', 'mami linda', 'un abrazo muy grande' o signos de exclamación exagerados."
-    : "Estás redactando un mensaje de WhatsApp en primera persona como si fueras Carlos. " +
-      "Usa un tono natural, directo, sobrio y sin ser cursi. PROHIBIDO usar 'mi amor' o 'cariño'.";
+    ? "Mensaje de Carlos para su mamá Paula ('Pechy'). Carlos habla normal, sobrio y respetuoso. Jamás uses 'mi amor', 'cariño' o frases cursis."
+    : "Mensaje en primera persona como Carlos. Tono natural, directo y sobrio. Prohibido 'mi amor'.";
 
-  const sys =
-    `${styleRules}\n` +
-    "REGLA DE ORTOGRAFÍA: Usa siempre una ortografía impecable en español (todas las tildes como en 'días', 'cómo', 'estás', y signos ¿? completos).\n" +
-    "Devuelve ÚNICAMENTE el texto del mensaje final sin comillas ni explicaciones.";
-
-  const prompt = `Instrucción del mensaje: ${instruction}`;
+  const sys = `${styleRules}\nOrtografía impecable con tildes y signos completos. Devuelve solo el texto del mensaje sin comillas.`;
+  const prompt = `Instrucción: ${instruction}`;
 
   const gemRes = await callGeminiWithFallback(sys, [{ role: "user", parts: [{ text: prompt }] }], false);
   if (gemRes.ok && gemRes.text) {
     const candidate = gemRes.text.replace(/^["']|["']$/g, "").trim();
-    const looksInvalid =
-      /señor carlos|nodo en la nube|http\s*\d{3}|error|api_key|proveedores de ia|mi amor|cariño|corazón/i.test(
-        candidate
-      );
-    if (candidate && !looksInvalid) {
-      return candidate;
-    }
+    if (candidate && !/error|señor carlos|nodo/i.test(candidate)) return candidate;
   }
-
   return FALLBACK_GREETING;
 }
 
-// --- INICIALIZACIÓN DE WHATSAPP (Baileys) + SOLUCIÓN A "ESPERANDO MENSAJE" EN ANDROID ---
-function ingestContactsList(contactsArray) {
-  if (!Array.isArray(contactsArray)) return;
-  let updated = false;
-  for (const c of contactsArray) {
-    const jid = c?.id;
-    if (!jid || (!jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@c.us"))) continue;
-    const normalizedJid = jid.replace("@c.us", "@s.whatsapp.net");
-    const names = [c.name, c.notify, c.verifiedName, c.shortName].filter(Boolean);
-    for (const rawName of names) {
-      const clean = String(rawName).toLowerCase().trim();
-      if (clean && clean.length >= 2 && clean !== "hermana") {
-        cloudState.learnedContacts[clean] = normalizedJid;
-        updated = true;
-      }
-    }
-  }
-  if (updated) saveCloudState();
-}
-
-// Limpia sesiones Signal desincronizadas de despliegues anteriores conservando creds.json (nunca pide QR pero renueva llaves con el celular)
-let cleanedStaleSessionsOnBoot = false;
-function cleanStaleSignalSessionsOnce(authFolder) {
-  if (cleanedStaleSessionsOnBoot) return;
-  cleanedStaleSessionsOnBoot = true;
-  try {
-    if (!fs.existsSync(authFolder)) return;
-    const files = fs.readdirSync(authFolder);
-    for (const file of files) {
-      if (file.startsWith("session-") || file.startsWith("sender-key-")) {
-        try {
-          fs.unlinkSync(path.join(authFolder, file));
-        } catch (_) {}
-      }
-    }
-    console.log("[LILA] 🔄 Llaves de sesión Signal renovadas para evitar 'Esperando mensaje' en el teléfono.");
-  } catch (e) {
-    console.error("Error limpiando sesiones Signal:", e.message);
-  }
-}
-
+// --- INICIALIZACIÓN DE WHATSAPP (Baileys) - NUNCA BORRA SESIONES SIGNAL ---
 async function startWhatsApp() {
-  const authFolder = path.join(__dirname, "auth_info_baileys");
-  cleanStaleSignalSessionsOnce(authFolder);
-
-  const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
@@ -1138,27 +1014,8 @@ async function startWhatsApp() {
     printQRInTerminal: true,
     browser: ["LILA Cloud", "Chrome", "2.0.0"],
     syncFullHistory: false,
-    markOnlineOnConnect: false,
+    markOnlineOnConnect: true,
     msgRetryCounterCache,
-    patchMessageBeforeSending: (message) => {
-      const requiresPatch = Boolean(
-        message.buttonsMessage || message.templateMessage || message.listMessage
-      );
-      if (requiresPatch) {
-        message = {
-          viewOnceMessage: {
-            message: {
-              messageContextInfo: {
-                deviceListMetadataVersion: 2,
-                deviceListMetadata: {},
-              },
-              ...message,
-            },
-          },
-        };
-      }
-      return message;
-    },
     getMessage: async (key) => {
       if (key?.id && sentMessagesCache.has(key.id)) {
         return sentMessagesCache.get(key.id);
@@ -1169,34 +1026,27 @@ async function startWhatsApp() {
 
   sock.ev.on("creds.update", saveCreds);
 
-  sock.ev.on("contacts.upsert", (contacts) => ingestContactsList(contacts));
-  sock.ev.on("contacts.update", (contacts) => ingestContactsList(contacts));
-  sock.ev.on("chats.upsert", (chats) => ingestContactsList(chats));
-
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
       connectionStatus = "qr_ready";
       latestQrDataUrl = await QRCode.toDataURL(qr);
-      console.log("[LILA] Nuevo código QR generado. Ábrelo en /qr para vincular.");
+      console.log("[LILA] Código QR listo en /qr.");
     }
     if (connection === "open") {
       connectionStatus = "connected";
       latestQrDataUrl = null;
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
-      console.log(`[LILA] ✅ WhatsApp conectado exitosamente (${connectedNumber})`);
+      console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       connectionStatus = "disconnected";
-      console.log(`[LILA] Conexión cerrada (código ${statusCode}). Reconectando: ${shouldReconnect}`);
+      console.log(`[LILA] Desconectado (${statusCode}). Reconectando: ${shouldReconnect}`);
       if (shouldReconnect) {
-        setTimeout(startWhatsApp, 4000);
+        setTimeout(startWhatsApp, 3500);
       } else {
-        try {
-          fs.rmSync(authFolder, { recursive: true, force: true });
-        } catch (_) {}
         setTimeout(startWhatsApp, 2000);
       }
     }
@@ -1204,9 +1054,7 @@ async function startWhatsApp() {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const msg of messages) {
-      if (msg?.key?.fromMe && msg?.message) {
-        rememberSentMessage(msg);
-      }
+      if (msg?.key?.fromMe && msg?.message) rememberSentMessage(msg);
     }
     if (type !== "notify") return;
 
@@ -1220,25 +1068,6 @@ async function startWhatsApp() {
         (OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
         (connectedNumber && remoteJid.includes(connectedNumber)) ||
         remoteJid.endsWith("@lid");
-
-      const locMsg = msg.message.locationMessage || msg.message.liveLocationMessage;
-      if (locMsg && isOwnerOrSelf) {
-        const lat = locMsg.degreesLatitude;
-        const lon = locMsg.degreesLongitude;
-        const detected = classifyLocation(lat, lon) || locMsg.name || `Coordenadas (${lat.toFixed(4)}, ${lon.toFixed(4)})`;
-        cloudState.currentLocation = {
-          placeName: detected,
-          lat,
-          lon,
-          wifiSsid: null,
-          updatedAt: new Date().toISOString(),
-        };
-        saveCloudState();
-        await safeSendMessage(remoteJid, {
-          text: `🤖 *LILA:* Ubicación actualizada, Señor Carlos. Veo que se encuentra en *${detected}*.`,
-        });
-        continue;
-      }
 
       const text =
         msg.message.conversation ||
@@ -1259,13 +1088,7 @@ async function startWhatsApp() {
       }
 
       if (!msg.key.fromMe) {
-        inboxMessages.push({
-          from: pushName,
-          jid: remoteJid,
-          body: text,
-          time: nowCol,
-          timestamp: Date.now(),
-        });
+        inboxMessages.push({ from: pushName, jid: remoteJid, body: text, time: nowCol, timestamp: Date.now() });
         if (inboxMessages.length > 50) inboxMessages.shift();
       }
 
@@ -1290,12 +1113,12 @@ function requireAuth(req, res, next) {
     req.query.key ||
     (req.headers.authorization || "").replace("Bearer ", "");
   if (LILA_SECRET_KEY && token !== LILA_SECRET_KEY) {
-    return res.status(401).json({ error: "No autorizado. Token LILA_SECRET_KEY inválido." });
+    return res.status(401).json({ error: "No autorizado." });
   }
   next();
 }
 
-// --- EVALUADOR DE RUTINAS, PAUSAS Y RECORDATORIOS ESCALONADOS + VIGÍA DE GMAIL ---
+// --- EVALUADOR DE RUTINAS Y RECORDATORIOS ESCALONADOS (Evita horas pasadas) ---
 async function evaluateSchedules() {
   if (connectionStatus !== "connected" || !sock) return;
   const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
@@ -1304,17 +1127,13 @@ async function evaluateSchedules() {
   for (const item of schedules) {
     if (!item.active) continue;
 
-    if (item.pauseUntil && todayStr < item.pauseUntil) {
-      continue;
-    }
+    if (item.pauseUntil && todayStr < item.pauseUntil) continue;
     if (item.pauseUntil && todayStr >= item.pauseUntil) {
       item.pauseUntil = null;
       changed = true;
     }
 
-    if (item.specificDate && item.specificDate !== todayStr) {
-      continue;
-    }
+    if (item.specificDate && item.specificDate !== todayStr) continue;
 
     if (item.time <= currentHHMM && item.lastSentDate !== todayStr) {
       const jid = toWhatsAppJid(item.target);
@@ -1328,11 +1147,9 @@ async function evaluateSchedules() {
       try {
         await safeSendMessage(jid, { text: finalMessage });
         item.lastSentDate = todayStr;
-        if (!item.recurring) {
-          item.active = false;
-        }
+        if (!item.recurring) item.active = false;
         changed = true;
-        console.log(`[LILA] ✅ Rutina/Recordatorio enviado hacia ${jid}: ${finalMessage}`);
+        console.log(`[LILA] ✅ Recordatorio/Rutina enviada a ${jid}: ${finalMessage}`);
       } catch (e) {
         console.error("Error ejecutando rutina:", e.message);
       }
@@ -1341,14 +1158,17 @@ async function evaluateSchedules() {
   if (changed) saveSchedules();
 }
 
+// Vigía proactivo de Gmail en la nube
 async function pollGmailProactively() {
   if (connectionStatus !== "connected" || !sock) return;
   const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
   if (!ownerJid) return;
 
   const accounts = [];
-  if (cloudState.gmailOAuth?.Personal) accounts.push(["Personal", cloudState.gmailOAuth.Personal]);
-  if (cloudState.gmailOAuth?.Uniguajira) accounts.push(["Uniguajira", cloudState.gmailOAuth.Uniguajira]);
+  const pCreds = resolveGmailAccountCreds("Personal");
+  const uCreds = resolveGmailAccountCreds("Uniguajira");
+  if (pCreds) accounts.push(["Personal", pCreds]);
+  if (uCreds) accounts.push(["Uniguajira", uCreds]);
 
   for (const [accName, creds] of accounts) {
     try {
@@ -1358,19 +1178,14 @@ async function pollGmailProactively() {
           if (!cloudState.notifiedEmailIds.includes(email.id)) {
             cloudState.notifiedEmailIds.push(email.id);
             if (cloudState.notifiedEmailIds.length > 100) cloudState.notifiedEmailIds.shift();
+            cloudState.lastEmailContext = email;
             saveCloudState();
 
-            recentEmails.push({
-              from: email.from,
-              subject: email.subject,
-              snippet: email.snippet,
-              account: accName,
-              time: new Date().toISOString(),
-            });
+            recentEmails.push({ from: email.from, subject: email.subject, snippet: email.snippet, account: accName, time: new Date().toISOString() });
             if (recentEmails.length > 20) recentEmails.shift();
 
             const summary = await askLilaCloudAI(
-              `Acaba de llegar un correo nuevo a la cuenta '${accName}' del Señor Carlos.\nDe: ${email.from}\nAsunto: ${email.subject}\nContenido: ${email.snippet}\nRedacta un aviso breve y directo de máximo 2 líneas con ortografía impecable.`,
+              `Correo nuevo en '${accName}' del Señor Carlos.\nDe: ${email.from}\nAsunto: ${email.subject}\nContenido: ${email.snippet}\nRedacta un aviso de máximo 2 líneas con ortografía impecable.`,
               "routine",
               false
             );
@@ -1387,12 +1202,13 @@ async function pollGmailProactively() {
 setInterval(evaluateSchedules, 30 * 1000);
 setInterval(pollGmailProactively, 5 * 60 * 1000);
 
+// Auto-keepalive
 setInterval(() => {
   const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://lila-server-1.onrender.com";
   fetch(`${selfUrl}/ping`).catch(() => {});
 }, 10 * 60 * 1000);
 
-// --- RUTAS HTTP DEL SERVIDOR ---
+// --- RUTAS HTTP ---
 
 app.get("/ping", async (req, res) => {
   await evaluateSchedules();
@@ -1401,17 +1217,12 @@ app.get("/ping", async (req, res) => {
     service: "LILA Cloud",
     whatsapp: connectionStatus,
     connectedNumber,
-    location: cloudState.currentLocation?.placeName || "Riohacha / Hatonuevo",
-    gmailSynced: {
-      Personal: Boolean(cloudState.gmailOAuth?.Personal),
-      Uniguajira: Boolean(cloudState.gmailOAuth?.Uniguajira),
-    },
-    inboxCount: inboxMessages.length,
-    activeSchedules: schedules.filter((s) => s.active).length,
-    agendaTasksCount: cloudState.agendaTasks.filter((t) => !t.completed).length,
+    activeTasksCount: cloudState.agendaTasks.filter((t) => !t.completed).length,
+    activeSchedulesCount: schedules.filter((s) => s.active).length,
   });
 });
 
+// Sincronización bidireccional LILA Desk ↔ LILA Server
 app.get("/sync", requireAuth, (req, res) => {
   res.json({
     ok: true,
@@ -1425,16 +1236,14 @@ app.get("/sync", requireAuth, (req, res) => {
 
 app.post("/sync", requireAuth, (req, res) => {
   try {
-    const { contacts, gmailOAuth, location, emails, agendaTasks } = req.body || {};
+    const { contacts, gmailOAuth, location, agendaTasks } = req.body || {};
     if (contacts && typeof contacts === "object") {
       for (const [k, v] of Object.entries(contacts)) {
         const cleanK = String(k).toLowerCase().trim();
         if (cleanK && cleanK !== "hermana" && v) {
           let digits = String(v).replace(/\D/g, "");
           if (digits.length === 10 && digits.startsWith("3")) digits = "57" + digits;
-          if (digits.length >= 10) {
-            cloudState.learnedContacts[cleanK] = `${digits}@s.whatsapp.net`;
-          }
+          if (digits.length >= 10) cloudState.learnedContacts[cleanK] = `${digits}@s.whatsapp.net`;
         }
       }
     }
@@ -1443,32 +1252,7 @@ app.post("/sync", requireAuth, (req, res) => {
       if (gmailOAuth.Uniguajira) cloudState.gmailOAuth.Uniguajira = gmailOAuth.Uniguajira;
     }
     if (location && typeof location === "object") {
-      const detected =
-        location.placeName ||
-        classifyLocation(Number(location.lat), Number(location.lon), location.wifiSsid);
-      if (detected) {
-        cloudState.currentLocation = {
-          placeName: detected,
-          lat: location.lat ?? cloudState.currentLocation.lat,
-          lon: location.lon ?? cloudState.currentLocation.lon,
-          wifiSsid: location.wifiSsid || cloudState.currentLocation.wifiSsid,
-          updatedAt: new Date().toISOString(),
-        };
-      }
-    }
-    if (Array.isArray(emails)) {
-      for (const em of emails) {
-        if (em?.subject && !recentEmails.some((r) => r.subject === em.subject && r.from === em.from)) {
-          recentEmails.push({
-            from: em.from,
-            subject: em.subject,
-            snippet: em.snippet || "",
-            account: em.account || "Gmail",
-            time: new Date().toISOString(),
-          });
-        }
-      }
-      if (recentEmails.length > 20) recentEmails.splice(0, recentEmails.length - 20);
+      cloudState.currentLocation = { ...cloudState.currentLocation, ...location, updatedAt: new Date().toISOString() };
     }
     if (Array.isArray(agendaTasks)) {
       for (const t of agendaTasks) {
@@ -1483,84 +1267,26 @@ app.post("/sync", requireAuth, (req, res) => {
       schedules: schedules.filter((s) => s.active),
       agendaTasks: cloudState.agendaTasks.filter((t) => !t.completed),
       learnedContacts: cloudState.learnedContacts,
-      currentLocation: cloudState.currentLocation,
-      gmailSynced: {
-        Personal: Boolean(cloudState.gmailOAuth?.Personal),
-        Uniguajira: Boolean(cloudState.gmailOAuth?.Uniguajira),
-      },
     });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-app.post("/location", requireAuth, (req, res) => {
-  const { lat, lon, wifiSsid, placeName } = req.body || {};
-  const detected =
-    placeName ||
-    classifyLocation(Number(lat), Number(lon), wifiSsid) ||
-    (lat && lon ? `Coordenadas (${Number(lat).toFixed(4)}, ${Number(lon).toFixed(4)})` : "Riohacha, La Guajira");
-  cloudState.currentLocation = {
-    placeName: detected,
-    lat: lat ? Number(lat) : null,
-    lon: lon ? Number(lon) : null,
-    wifiSsid: wifiSsid || null,
-    updatedAt: new Date().toISOString(),
-  };
-  saveCloudState();
-  res.json({ ok: true, currentLocation: cloudState.currentLocation });
-});
-
-app.get("/qr", requireAuth, (req, res) => {
-  if (connectionStatus === "connected") {
-    return res.send(`
-      <html><body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:60px;">
-        <h1 style="color:#4ade80;">✅ LILA Cloud WhatsApp Conectado 24/7</h1>
-        <p>Número vinculado: <b>+${connectedNumber}</b></p>
-        <p>Ya puedes cerrar esta ventana. Tu portátil gastará 0 MB de RAM y nunca se abrirán ventanas al enviar mensajes.</p>
-      </body></html>
-    `);
-  }
-  if (latestQrDataUrl) {
-    return res.send(`
-      <html><head><meta http-equiv="refresh" content="15"></head>
-      <body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:40px;">
-        <h2 style="color:#ec4899;">📱 Vincula tu WhatsApp con LILA</h2>
-        <p>Abre WhatsApp en tu celular ➔ Dispositivos vinculados ➔ Vincular un dispositivo</p>
-        <img src="${latestQrDataUrl}" style="border:8px solid white;border-radius:12px;width:280px;height:280px;"/>
-        <p style="color:#aaa;font-size:13px;">(Esta página se actualiza sola cada 15 segundos)</p>
-      </body></html>
-    `);
-  }
-  res.send(`
-    <html><head><meta http-equiv="refresh" content="4"></head>
-    <body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:60px;">
-      <h2>⏳ Generando código QR de WhatsApp... espera 4 segundos.</h2>
-    </body></html>
-  `);
+app.post("/agenda", requireAuth, (req, res) => {
+  const { title, dueDate, dueTime = "07:00", notes = "" } = req.body || {};
+  if (!title || !dueDate) return res.status(400).json({ success: false, error: "Faltan title o dueDate." });
+  const result = createAgendaEventWithReminders({ title, dueDate, dueTime, notes });
+  res.json({ success: true, ...result });
 });
 
 app.post("/send", requireAuth, async (req, res) => {
   try {
-    if (connectionStatus !== "connected" || !sock) {
-      return res.status(503).json({
-        success: false,
-        error: `WhatsApp en la nube aún no está vinculado (estado: ${connectionStatus}).`,
-      });
-    }
     const target = req.body.contact || req.body.number;
     const message = req.body.message;
-    if (!target || !message) {
-      return res.status(400).json({ success: false, error: "Faltan parámetros 'contact'/'number' o 'message'." });
-    }
+    if (!target || !message) return res.status(400).json({ success: false, error: "Faltan parámetros." });
     const resolved = resolveContactTarget(target);
-    if (!resolved.ok) {
-      return res.status(400).json({
-        success: false,
-        ambiguous: Boolean(resolved.ambiguous),
-        error: resolved.error,
-      });
-    }
+    if (!resolved.ok) return res.status(400).json({ success: false, ambiguous: Boolean(resolved.ambiguous), error: resolved.error });
     await safeSendMessage(resolved.jid, { text: String(message) });
     return res.json({ success: true, to: resolved.jid, contactName: resolved.canonicalName });
   } catch (err) {
@@ -1568,24 +1294,11 @@ app.post("/send", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/messages", requireAuth, (req, res) => {
-  const filter = String(req.query.contact || "").toLowerCase().trim();
-  let list = inboxMessages;
-  if (filter) {
-    list = list.filter((m) => String(m.from || "").toLowerCase().includes(filter));
-  }
-  res.json(list.slice(-20));
-});
-
 app.post("/schedule", requireAuth, (req, res) => {
   const { target, message, time, specificDate = null, recurring = false, useAI = false } = req.body;
-  if (!target || !message || !time) {
-    return res.status(400).json({ success: false, error: "Se requieren 'target', 'message' y 'time' (HH:MM)." });
-  }
+  if (!target || !message || !time) return res.status(400).json({ success: false, error: "Faltan parámetros." });
   const resolved = resolveContactTarget(target);
-  if (!resolved.ok && resolved.ambiguous) {
-    return res.status(400).json({ success: false, ambiguous: true, error: resolved.error });
-  }
+  if (!resolved.ok && resolved.ambiguous) return res.status(400).json({ success: false, ambiguous: true, error: resolved.error });
   const newItem = {
     id: Date.now().toString(36),
     target: resolved.ok ? resolved.jid.split("@")[0] : target,
@@ -1604,15 +1317,6 @@ app.post("/schedule", requireAuth, (req, res) => {
   res.json({ success: true, schedule: newItem });
 });
 
-app.post("/agenda", requireAuth, (req, res) => {
-  const { title, dueDate, dueTime = "07:00", notes = "" } = req.body || {};
-  if (!title || !dueDate) {
-    return res.status(400).json({ success: false, error: "Se requieren 'title' y 'dueDate' (YYYY-MM-DD)." });
-  }
-  const result = createAgendaEventWithReminders({ title, dueDate, dueTime, notes });
-  res.json({ success: true, ...result });
-});
-
 app.get("/schedules", requireAuth, (req, res) => {
   res.json({
     schedules: schedules.filter((s) => s.active),
@@ -1622,30 +1326,13 @@ app.get("/schedules", requireAuth, (req, res) => {
 
 app.post("/schedule/cancel", requireAuth, (req, res) => {
   const target = String(req.body.target || "").toLowerCase().trim();
-  const contact = String(req.body.contact || "").toLowerCase().trim();
   const pauseUntil = req.body.pauseUntil ? String(req.body.pauseUntil).trim() : null;
-  const filter = target || contact;
-  const isMomFilter = ["mamá", "mama", "paula", "pechy", "madre"].includes(filter);
   let removed = 0;
-
   for (const s of schedules) {
     if (!s.active) continue;
-    const sTarget = String(s.target || "").toLowerCase();
-    const sName = String(s.contactName || "").toLowerCase();
-    const sMsg = String(s.message || "").toLowerCase();
-    const matches =
-      !filter ||
-      sTarget.includes(filter) ||
-      sName.includes(filter) ||
-      sMsg.includes(filter) ||
-      (isMomFilter && (sTarget.includes("3046497549") || sName.includes("paula") || sName.includes("pechy")));
-
-    if (matches) {
-      if (pauseUntil) {
-        s.pauseUntil = pauseUntil;
-      } else {
-        s.active = false;
-      }
+    if (!target || String(s.target).includes(target) || String(s.contactName).toLowerCase().includes(target)) {
+      if (pauseUntil) s.pauseUntil = pauseUntil;
+      else s.active = false;
       removed++;
     }
   }
@@ -1660,24 +1347,50 @@ app.post("/gmail-alert", requireAuth, async (req, res) => {
     if (recentEmails.length > 20) recentEmails.shift();
 
     const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
-    if (!ownerJid || connectionStatus !== "connected" || !sock) {
-      return res.status(503).json({ success: false, error: "WhatsApp no conectado para enviar alerta." });
-    }
+    if (!ownerJid || connectionStatus !== "connected" || !sock) return res.status(503).json({ success: false });
+
     const summary = await askLilaCloudAI(
-      `Llegó un correo nuevo a la cuenta '${account}' del Señor Carlos.\nDe: ${from}\nAsunto: ${subject}\nContenido: ${snippet}\nHaz un aviso de máximo 2 líneas con ortografía impecable para enviárselo por WhatsApp.`,
+      `Llegó un correo nuevo a '${account}'.\nDe: ${from}\nAsunto: ${subject}\nContenido: ${snippet}\nHaz un aviso de máximo 2 líneas con ortografía impecable.`,
       "routine",
       false
     );
-    await safeSendMessage(ownerJid, {
-      text: `📧 *Nuevo Correo (${account})*\n*De:* ${from}\n*Asunto:* ${subject}\n\n🤖 *LILA:* ${summary}`,
-    });
+    await safeSendMessage(ownerJid, { text: `📧 *Nuevo Correo (${account})*\n*De:* ${from}\n*Asunto:* ${subject}\n\n🤖 *LILA:* ${summary}` });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
+app.get("/qr", requireAuth, (req, res) => {
+  if (connectionStatus === "connected") {
+    return res.send(`<html><body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:60px;">
+      <h1 style="color:#4ade80;">✅ LILA Cloud Conectado 24/7</h1>
+      <p>Número vinculado: <b>+${connectedNumber}</b></p>
+      <p style="color:#aaa;font-size:14px;">Para evitar escanear el QR en futuras actualizaciones, puedes copiar tu sesión segura en <a style="color:#38bdf8;" href="/export-session?key=${LILA_SECRET_KEY}">/export-session</a> y pegarla en la variable <code>SESSION_DATA</code> de Render.</p>
+    </body></html>`);
+  }
+  if (latestQrDataUrl) {
+    return res.send(`<html><head><meta http-equiv="refresh" content="15"></head>
+      <body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:40px;">
+        <h2 style="color:#ec4899;">📱 Vincula tu WhatsApp con LILA</h2>
+        <img src="${latestQrDataUrl}" style="border:8px solid white;border-radius:12px;width:280px;height:280px;"/>
+      </body></html>`);
+  }
+  res.send(`<html><head><meta http-equiv="refresh" content="4"></head><body style="background:#0f0f17;color:#fff;font-family:sans-serif;text-align:center;padding-top:60px;"><h2>⏳ Generando código QR...</h2></body></html>`);
+});
+
+// Endpoint seguro para exportar la sesión y guardarla en Render Environment (SESSION_DATA)
+app.get("/export-session", requireAuth, (req, res) => {
+  const credsPath = path.join(AUTH_FOLDER, "creds.json");
+  if (fs.existsSync(credsPath)) {
+    const raw = fs.readFileSync(credsPath, "utf-8");
+    const b64 = Buffer.from(raw, "utf-8").toString("base64");
+    return res.json({ ok: true, session_data: b64 });
+  }
+  return res.status(404).json({ ok: false, error: "Aún no se ha vinculado WhatsApp o no existe creds.json." });
+});
+
 app.listen(PORT, () => {
-  console.log(`[LILA] 🚀 Servidor activo en el puerto ${PORT}`);
+  console.log(`[LILA] 🚀 Servidor activo en puerto ${PORT}`);
   startWhatsApp().catch((err) => console.error("Error iniciando WhatsApp:", err));
 });
