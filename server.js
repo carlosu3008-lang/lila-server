@@ -22,25 +22,59 @@ const OWNER_PHONE = (process.env.OWNER_PHONE || "573018276980").replace(/\D/g, "
 
 const silentLogger = pino({ level: "silent" });
 
+// --- CONEXIÓN PERMANENTE CON MONGODB ATLAS ---
+let MongoClient = null;
+try {
+  MongoClient = require("mongodb").MongoClient;
+} catch (_) {
+  MongoClient = null;
+}
+
+const MONGODB_URI = (
+  process.env.MONGODB_URI ||
+  "mongodb+srv://carlosuriana2007_db_user:IrEv3ZutCpBNVTR7@cluster0.zna8fzy.mongodb.net/lila?retryWrites=true&w=majority"
+).trim();
+
+let mongoClient = null;
+let mongoDb = null;
+let isMongoConnected = false;
+
+async function initMongo() {
+  if (!MongoClient || !MONGODB_URI) return;
+  try {
+    mongoClient = new MongoClient(MONGODB_URI, {
+      serverSelectionTimeoutMS: 8000,
+      connectTimeoutMS: 12000,
+    });
+    await mongoClient.connect();
+    mongoDb = mongoClient.db("lila");
+    isMongoConnected = true;
+    console.log("[LILA] 🍃 Conectado exitosamente a MongoDB Atlas (Base de datos: lila)");
+  } catch (err) {
+    console.error("[LILA] ⚠️ Error conectando a MongoDB Atlas:", err.message);
+    isMongoConnected = false;
+  }
+}
+
 // Estado de WhatsApp en memoria
 let sock = null;
 let latestQrDataUrl = null;
 let connectionStatus = "initializing"; // initializing | qr_ready | connected | disconnected
 let connectedNumber = null;
 
-// --- PERSISTENCIA EN DISCO (cloud_state.json + schedules.json) ---
+// --- PERSISTENCIA EN DISCO (cloud_state.json + schedules.json) + MONGODB ---
 const STATE_FILE = path.join(__dirname, "cloud_state.json");
 const SCHEDULES_FILE = path.join(__dirname, "schedules.json");
 const AUTH_FOLDER = path.join(__dirname, "auth_info_baileys");
 
-// Restaurar creds.json desde SESSION_DATA si está configurada en Render (cero QR tras despliegues)
+// Restaurar creds.json desde SESSION_DATA si está configurada en Render (respaldo secundario)
 if (process.env.SESSION_DATA) {
   try {
     if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
     const credsPath = path.join(AUTH_FOLDER, "creds.json");
     const rawCreds = Buffer.from(process.env.SESSION_DATA.trim(), "base64").toString("utf-8");
     fs.writeFileSync(credsPath, rawCreds, "utf-8");
-    console.log("[LILA] ✅ Credenciales de WhatsApp restauradas permanentemente desde SESSION_DATA.");
+    console.log("[LILA] ✅ Credenciales de WhatsApp restauradas desde SESSION_DATA.");
   } catch (err) {
     console.error("Error restaurando SESSION_DATA:", err.message);
   }
@@ -66,7 +100,7 @@ let cloudState = {
     Uniguajira: null,
   },
   notifiedEmailIds: [],
-  lastEmailContext: null, // Guarda el último correo para que pueda responderle diciendo "Lila, respóndele que..."
+  lastEmailContext: null,
 };
 
 try {
@@ -84,11 +118,56 @@ try {
   console.error("Error cargando cloud_state.json:", e.message);
 }
 
-function saveCloudState() {
+// Carga e inicialización profunda desde MongoDB Atlas
+async function loadStateFromMongo() {
+  if (!isMongoConnected || !mongoDb) return;
+  try {
+    const col = mongoDb.collection("cloud_state");
+    const doc = await col.findOne({ _id: "main_state" });
+    if (doc) {
+      cloudState = {
+        ...cloudState,
+        learnedContacts: { ...cloudState.learnedContacts, ...(doc.learnedContacts || {}) },
+        currentLocation: { ...cloudState.currentLocation, ...(doc.currentLocation || {}) },
+        gmailOAuth: { ...cloudState.gmailOAuth, ...(doc.gmailOAuth || {}) },
+        agendaTasks: Array.isArray(doc.agendaTasks) ? doc.agendaTasks : cloudState.agendaTasks,
+        notifiedEmailIds: Array.isArray(doc.notifiedEmailIds) ? doc.notifiedEmailIds : cloudState.notifiedEmailIds,
+        lastEmailContext: doc.lastEmailContext || cloudState.lastEmailContext,
+      };
+      console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
+    }
+
+    const schedCol = mongoDb.collection("schedules");
+    const schedDocs = await schedCol.find({ active: true }).toArray();
+    if (schedDocs && schedDocs.length > 0) {
+      const existingIds = new Set(schedules.map((s) => s.id));
+      for (const s of schedDocs) {
+        if (!existingIds.has(s.id)) schedules.push(s);
+      }
+      console.log(`[LILA] 🍃 ${schedDocs.length} rutinas activas cargadas desde MongoDB.`);
+    }
+  } catch (err) {
+    console.error("Error cargando estado desde MongoDB:", err.message);
+  }
+}
+
+async function saveCloudState() {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(cloudState, null, 2), "utf-8");
   } catch (e) {
     console.error("Error guardando cloud_state.json:", e.message);
+  }
+  if (isMongoConnected && mongoDb) {
+    try {
+      const col = mongoDb.collection("cloud_state");
+      await col.updateOne(
+        { _id: "main_state" },
+        { $set: { ...cloudState, updatedAt: new Date().toISOString() } },
+        { upsert: true }
+      );
+    } catch (e) {
+      console.error("Error guardando en MongoDB cloud_state:", e.message);
+    }
   }
 }
 
@@ -101,11 +180,83 @@ try {
   schedules = [];
 }
 
-function saveSchedules() {
+async function saveSchedules() {
   try {
     fs.writeFileSync(SCHEDULES_FILE, JSON.stringify(schedules, null, 2), "utf-8");
   } catch (e) {
     console.error("Error guardando schedules:", e.message);
+  }
+  if (isMongoConnected && mongoDb) {
+    try {
+      const col = mongoDb.collection("schedules");
+      for (const item of schedules) {
+        await col.updateOne({ id: item.id }, { $set: item }, { upsert: true });
+      }
+    } catch (e) {
+      console.error("Error guardando en MongoDB schedules:", e.message);
+    }
+  }
+}
+
+// --- PERSISTENCIA TOTAL DE LA SESIÓN DE WHATSAPP EN MONGODB ---
+async function restoreAuthFromMongo() {
+  if (!isMongoConnected || !mongoDb) return;
+  try {
+    const col = mongoDb.collection("whatsapp_auth");
+    const files = await col.find({}).toArray();
+    if (files.length > 0) {
+      if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+      for (const f of files) {
+        if (f.fileName && f.content) {
+          const filePath = path.join(AUTH_FOLDER, f.fileName);
+          fs.writeFileSync(filePath, f.content, "utf-8");
+        }
+      }
+      console.log(`[LILA] 🍃 ${files.length} archivos de sesión de WhatsApp restaurados desde MongoDB.`);
+    }
+  } catch (err) {
+    console.error("Error restaurando sesión de WhatsApp desde MongoDB:", err.message);
+  }
+}
+
+async function syncAllAuthToMongo() {
+  if (!isMongoConnected || !mongoDb || !fs.existsSync(AUTH_FOLDER)) return;
+  try {
+    const col = mongoDb.collection("whatsapp_auth");
+    const files = fs.readdirSync(AUTH_FOLDER);
+    for (const file of files) {
+      const fullPath = path.join(AUTH_FOLDER, file);
+      if (fs.statSync(fullPath).isFile()) {
+        const content = fs.readFileSync(fullPath, "utf-8");
+        await col.updateOne(
+          { fileName: file },
+          { $set: { fileName: file, content, updatedAt: new Date().toISOString() } },
+          { upsert: true }
+        );
+      }
+    }
+    console.log(`[LILA] 🍃 Sesión de WhatsApp respaldada en MongoDB (${files.length} archivos).`);
+  } catch (err) {
+    console.error("Error respaldando sesión en MongoDB:", err.message);
+  }
+}
+
+// --- REGISTRO DE FINANZAS Y GASTOS (Nequi / Bancolombia) ---
+async function recordFinanceTransaction({ from, to, amount, description, rawText }) {
+  if (!isMongoConnected || !mongoDb) return;
+  try {
+    const col = mongoDb.collection("finances");
+    await col.insertOne({
+      from,
+      to,
+      amount,
+      description,
+      rawText,
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`[LILA] 💰 Transacción registrada en MongoDB: ${amount} a ${to}`);
+  } catch (e) {
+    console.error("Error guardando finanzas en MongoDB:", e.message);
   }
 }
 
@@ -129,31 +280,40 @@ function createSimpleCache(maxEntries = 3000) {
 const msgRetryCounterCache = createSimpleCache(3000);
 const sentMessagesCache = new Map();
 
-function rememberSentMessage(msgObj) {
-  if (msgObj?.key?.id && msgObj?.message) {
-    sentMessagesCache.set(msgObj.key.id, msgObj.message);
-    if (sentMessagesCache.size > 800) {
-      const firstKey = sentMessagesCache.keys().next().value;
-      sentMessagesCache.delete(firstKey);
-    }
+function rememberMessage(msgObj) {
+  if (!msgObj?.key?.id) return;
+  const id = msgObj.key.id;
+  const remoteJid = msgObj.key.remoteJid || "";
+  const messageContent = msgObj.message;
+  if (!messageContent) return;
+
+  sentMessagesCache.set(id, messageContent);
+  if (remoteJid) {
+    sentMessagesCache.set(`${remoteJid}:${id}`, messageContent);
+  }
+  if (sentMessagesCache.size > 3000) {
+    const firstKey = sentMessagesCache.keys().next().value;
+    sentMessagesCache.delete(firstKey);
   }
 }
 
-// Normaliza el JID del chat propio para que el teléfono maestro y el PC sincronicen sin error de llave
+// Normaliza el JID respetando grupos (@g.us) y canales
 function normalizeTargetJid(jid) {
   if (!jid) return null;
+  const raw = String(jid).trim();
+  if (raw.endsWith("@g.us")) return raw;
   const ownerNum = OWNER_PHONE || connectedNumber;
-  if (ownerNum && (jid.includes(ownerNum) || jid.endsWith("@lid"))) {
+  if (ownerNum && (raw.includes(ownerNum) || raw.endsWith("@lid"))) {
     return `${ownerNum}@s.whatsapp.net`;
   }
-  return jid;
+  return raw;
 }
 
-async function safeSendMessage(jid, content) {
+async function safeSendMessage(jid, content, options = {}) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
   const target = normalizeTargetJid(jid);
-  const sent = await sock.sendMessage(target, content);
-  rememberSentMessage(sent);
+  const sent = await sock.sendMessage(target, content, options);
+  if (sent) rememberMessage(sent);
   return sent;
 }
 
@@ -753,10 +913,30 @@ const CLOUD_TOOLS_DECLARATIONS = [
       required: ["target", "message"],
     },
   },
+  {
+    name: "get_finances_summary",
+    description: "Consulta el historial de movimientos financieros, transferencias o pagos de Nequi guardados en la base de datos.",
+    parameters: {
+      type: "OBJECT",
+      properties: {},
+    },
+  },
 ];
 
 async function executeCloudToolCall(name, args) {
   switch (name) {
+    case "get_finances_summary": {
+      if (!isMongoConnected || !mongoDb) return "Base de datos de finanzas en MongoDB no disponible en este momento.";
+      try {
+        const col = mongoDb.collection("finances");
+        const docs = await col.find({}).sort({ timestamp: -1 }).limit(8).toArray();
+        if (!docs || docs.length === 0) return "No hay registros de transferencias o pagos guardados recientemente.";
+        const lines = docs.map((d) => `- ${d.amount} a ${d.to} (${d.description || ""}) [${(d.timestamp || "").split("T")[0]}]`);
+        return `Últimos movimientos registrados en finanzas:\n` + lines.join("\n");
+      } catch (err) {
+        return `Error consultando finanzas: ${err.message}`;
+      }
+    }
     case "get_weather":
       return await getWeatherLive(args?.city || "");
     case "check_gmail":
@@ -1017,14 +1197,21 @@ async function startWhatsApp() {
     markOnlineOnConnect: true,
     msgRetryCounterCache,
     getMessage: async (key) => {
-      if (key?.id && sentMessagesCache.has(key.id)) {
+      if (!key?.id) return undefined;
+      if (key.remoteJid && sentMessagesCache.has(`${key.remoteJid}:${key.id}`)) {
+        return sentMessagesCache.get(`${key.remoteJid}:${key.id}`);
+      }
+      if (sentMessagesCache.has(key.id)) {
         return sentMessagesCache.get(key.id);
       }
       return undefined;
     },
   });
 
-  sock.ev.on("creds.update", saveCreds);
+  sock.ev.on("creds.update", async () => {
+    await saveCreds();
+    syncAllAuthToMongo().catch(() => {});
+  });
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
@@ -1038,12 +1225,14 @@ async function startWhatsApp() {
       latestQrDataUrl = null;
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
       console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
+      syncAllAuthToMongo().catch(() => {});
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       connectionStatus = "disconnected";
       console.log(`[LILA] Desconectado (${statusCode}). Reconectando: ${shouldReconnect}`);
+      syncAllAuthToMongo().catch(() => {});
       if (shouldReconnect) {
         setTimeout(startWhatsApp, 3500);
       } else {
@@ -1054,7 +1243,7 @@ async function startWhatsApp() {
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     for (const msg of messages) {
-      if (msg?.key?.fromMe && msg?.message) rememberSentMessage(msg);
+      if (msg?.message) rememberMessage(msg);
     }
     if (type !== "notify") return;
 
@@ -1099,8 +1288,9 @@ async function startWhatsApp() {
       if (isCommandForLila && isOwnerOrSelf) {
         const query = cleanText.replace(/^lila[,:\s]+/i, "").trim();
         if (query) {
-          const reply = await askLilaCloudAI(query, "owner_self", true);
-          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply}` });
+          const historyKey = remoteJid || "owner_self";
+          const reply = await askLilaCloudAI(query, historyKey, true);
+          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply}` }, { quoted: msg });
         }
       }
     }
@@ -1390,7 +1580,36 @@ app.get("/export-session", requireAuth, (req, res) => {
   return res.status(404).json({ ok: false, error: "Aún no se ha vinculado WhatsApp o no existe creds.json." });
 });
 
-app.listen(PORT, () => {
+// Endpoint para reiniciar la sesión de WhatsApp limpiamente si hay conflicto de llaves
+app.get("/reset-session", requireAuth, async (req, res) => {
+  try {
+    if (sock) {
+      try { sock.logout(); } catch (_) {}
+      try { sock.end(); } catch (_) {}
+      sock = null;
+    }
+    if (fs.existsSync(AUTH_FOLDER)) {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    }
+    sentMessagesCache.clear();
+    connectionStatus = "initializing";
+    setTimeout(startWhatsApp, 2000);
+    res.json({ ok: true, message: "Sesión reiniciada limpiamente. Abre /qr para escanear el nuevo código." });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.listen(PORT, async () => {
   console.log(`[LILA] 🚀 Servidor activo en puerto ${PORT}`);
+  if (MongoClient) {
+    try {
+      await initMongo();
+      await loadStateFromMongo();
+      await restoreAuthFromMongo();
+    } catch (e) {
+      console.error("[LILA] Error en inicialización de MongoDB:", e.message);
+    }
+  }
   startWhatsApp().catch((err) => console.error("Error iniciando WhatsApp:", err));
 });
