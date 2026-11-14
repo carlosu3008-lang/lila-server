@@ -101,6 +101,8 @@ let cloudState = {
   },
   notifiedEmailIds: [],
   lastEmailContext: null,
+  recentFetchedEmails: [],
+  lilaNotificationGroupJid: null,
 };
 
 try {
@@ -133,6 +135,8 @@ async function loadStateFromMongo() {
         agendaTasks: Array.isArray(doc.agendaTasks) ? doc.agendaTasks : cloudState.agendaTasks,
         notifiedEmailIds: Array.isArray(doc.notifiedEmailIds) ? doc.notifiedEmailIds : cloudState.notifiedEmailIds,
         lastEmailContext: doc.lastEmailContext || cloudState.lastEmailContext,
+        recentFetchedEmails: Array.isArray(doc.recentFetchedEmails) ? doc.recentFetchedEmails : cloudState.recentFetchedEmails,
+        lilaNotificationGroupJid: doc.lilaNotificationGroupJid || cloudState.lilaNotificationGroupJid,
       };
       console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
     }
@@ -389,11 +393,67 @@ function calculateDaysDifference(targetDateStr, baseDateStr) {
   return Math.round((dt1 - dt2) / (1000 * 60 * 60 * 24));
 }
 
-// --- RESOLUCIÓN DE CONTACTOS Y DESAMBIGUACIÓN (Nelly vs Perla, Paula/Pechy) ---
+// --- SINCRONIZACIÓN DE GRUPOS Y RESOLUCIÓN INTELIGENTE DE CONTACTOS/GRUPOS ---
+function normalizeSearchKey(str) {
+  return String(str || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/^(el\s+grupo\s+de\s+whatsapp|grupo\s+de\s+whatsapp|el\s+grupo|grupo|chat|mi)\s+/i, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+async function syncWhatsAppGroups() {
+  if (!sock || connectionStatus !== "connected") return;
+  try {
+    const groups = await sock.groupFetchAllParticipating();
+    let changed = false;
+    for (const [jid, meta] of Object.entries(groups || {})) {
+      const subject = String(meta?.subject || "").trim();
+      if (!subject || !jid.endsWith("@g.us")) continue;
+      const lowerSub = subject.toLowerCase();
+      if (cloudState.learnedContacts[lowerSub] !== jid) {
+        cloudState.learnedContacts[lowerSub] = jid;
+        changed = true;
+      }
+      if (normalizeSearchKey(subject) === "lila" || lowerSub === "lila") {
+        if (cloudState.lilaNotificationGroupJid !== jid) {
+          cloudState.lilaNotificationGroupJid = jid;
+          changed = true;
+          console.log(`[LILA] 🔔 Grupo oficial de notificaciones 'LILA' detectado: ${jid}`);
+        }
+      }
+    }
+    if (changed) saveCloudState();
+  } catch (err) {
+    console.error("Error sincronizando grupos de WhatsApp:", err.message);
+  }
+}
+
+function getOwnerNotificationJid() {
+  if (cloudState.lilaNotificationGroupJid && cloudState.lilaNotificationGroupJid.endsWith("@g.us")) {
+    return cloudState.lilaNotificationGroupJid;
+  }
+  if (cloudState.learnedContacts["lila"] && cloudState.learnedContacts["lila"].endsWith("@g.us")) {
+    return cloudState.learnedContacts["lila"];
+  }
+  const ownerNum = OWNER_PHONE || connectedNumber || "573018276980";
+  return `${ownerNum}@s.whatsapp.net`;
+}
+
 function resolveContactTarget(target) {
   if (!target) return { ok: false, error: "No se indicó destinatario." };
   const raw = String(target).trim();
-  const lower = raw.toLowerCase().replace(/^mi\s+/, "").trim();
+  const lower = raw
+    .toLowerCase()
+    .replace(/^(el\s+grupo\s+de\s+whatsapp|grupo\s+de\s+whatsapp|el\s+grupo|grupo|mi)\s+/i, "")
+    .trim();
+  const normTarget = normalizeSearchKey(lower);
+
+  if (lower === "lila_group" || lower === "notificaciones_lila") {
+    const notifJid = getOwnerNotificationJid();
+    return { ok: true, jid: notifJid, canonicalName: "Grupo LILA", relationship: "owner_group" };
+  }
 
   if (lower === "hermana" || lower === "hermanas" || raw.toLowerCase() === "mi hermana") {
     return {
@@ -403,7 +463,7 @@ function resolveContactTarget(target) {
     };
   }
 
-  if (["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower)) {
+  if (["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower) || ["mama", "mami", "madre", "paula", "pechy"].includes(normTarget)) {
     const momJid =
       cloudState.learnedContacts["paula"] ||
       cloudState.learnedContacts["pechy"] ||
@@ -425,9 +485,21 @@ function resolveContactTarget(target) {
     };
   }
 
+  // Búsqueda exacta sin espacios ni tildes (ej. "cuarto game r" === "Cuarto gamer")
+  for (const [name, jid] of Object.entries(cloudState.learnedContacts)) {
+    if (normTarget && normalizeSearchKey(name) === normTarget) {
+      return { ok: true, jid, canonicalName: name, relationship: "general" };
+    }
+  }
+
   const matches = [];
   for (const [name, jid] of Object.entries(cloudState.learnedContacts)) {
-    if (name.includes(lower) || lower.includes(name)) {
+    const normName = normalizeSearchKey(name);
+    if (
+      name.includes(lower) ||
+      lower.includes(name) ||
+      (normTarget.length >= 3 && (normName.includes(normTarget) || normTarget.includes(normName)))
+    ) {
       matches.push({ name, jid });
     }
   }
@@ -436,11 +508,11 @@ function resolveContactTarget(target) {
     return { ok: true, jid: uniqueJids[0], canonicalName: matches[0].name, relationship: "general" };
   }
   if (uniqueJids.length > 1) {
-    const namesList = matches.map((m) => `${m.name} (+${m.jid.split("@")[0]})`).join(", ");
+    const namesList = matches.map((m) => `${m.name} (${m.jid.endsWith("@g.us") ? "Grupo" : "+" + m.jid.split("@")[0]})`).join(", ");
     return {
       ok: false,
       ambiguous: true,
-      error: `Señor Carlos, encontré varios contactos que coinciden con '${raw}': ${namesList}. ¿A cuál de ellos se refiere?`,
+      error: `Señor Carlos, encontré varios chats o contactos que coinciden con '${raw}': ${namesList}. ¿A cuál de ellos se refiere?`,
     };
   }
 
@@ -452,8 +524,17 @@ function resolveContactTarget(target) {
 
   return {
     ok: false,
-    error: `Señor Carlos, aún no tengo registrado el número de '${raw}' en mi memoria. ¿Me indica su número para guardarlo?`,
+    error: `Señor Carlos, aún no tengo registrado el chat o contacto '${raw}' en mi memoria. Si es una persona, ¿me indica su número para guardarlo?`,
   };
+}
+
+async function resolveContactTargetAsync(target) {
+  let res = resolveContactTarget(target);
+  if (!res.ok && !res.ambiguous) {
+    await syncWhatsAppGroups();
+    res = resolveContactTarget(target);
+  }
+  return res;
 }
 
 function toWhatsAppJid(target) {
@@ -661,6 +742,8 @@ async function queryGmailAccountLive(accountName, oauthCreds, query = "is:unread
       const msgData = await msgRes.json();
       const headers = msgData.payload?.headers || [];
       const from = headers.find((h) => h.name.toLowerCase() === "from")?.value || "Desconocido";
+      const emailMatch = from.match(/<([^>]+@[^>]+)>/) || from.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+      const emailAddress = emailMatch ? emailMatch[1].trim() : from.trim();
       const subject = headers.find((h) => h.name.toLowerCase() === "subject")?.value || "Sin asunto";
       const messageIdHeader = headers.find((h) => h.name.toLowerCase() === "message-id")?.value || null;
       detailed.push({
@@ -669,6 +752,7 @@ async function queryGmailAccountLive(accountName, oauthCreds, query = "is:unread
         messageIdHeader,
         account: accountName,
         from,
+        emailAddress,
         subject,
         snippet: msgData.snippet || "",
       });
@@ -690,6 +774,7 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
   }
 
   const lines = [];
+  const newlyFetched = [];
   for (const [accName, creds] of accounts) {
     try {
       const res = await queryGmailAccountLive(accName, creds, query, 5);
@@ -699,14 +784,27 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
         } else {
           lines.push(`Bandeja ${accName} (${res.emails.length} encontrados):`);
           for (const e of res.emails) {
-            cloudState.lastEmailContext = e;
-            lines.push(`- De: ${e.from} | Asunto: ${e.subject} | Resumen: ${e.snippet}`);
+            newlyFetched.push(e);
+            lines.push(`- De: ${e.from} [Correo para responder: ${e.emailAddress}] | Asunto: ${e.subject} | Resumen: ${e.snippet}`);
           }
         }
       }
     } catch (err) {
       lines.push(`Bandeja ${accName}: Error al consultar (${err.message}).`);
     }
+  }
+
+  if (newlyFetched.length > 0) {
+    // El correo #1 (más reciente) queda como contexto principal de respuesta inmediata
+    cloudState.lastEmailContext = newlyFetched[0];
+    if (!Array.isArray(cloudState.recentFetchedEmails)) cloudState.recentFetchedEmails = [];
+    for (const e of newlyFetched.reverse()) {
+      cloudState.recentFetchedEmails = [
+        e,
+        ...cloudState.recentFetchedEmails.filter((x) => x.id !== e.id),
+      ].slice(0, 20);
+    }
+    saveCloudState();
   }
 
   if (lines.length > 0) return lines.join("\n");
@@ -739,7 +837,7 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
   };
   cloudState.agendaTasks.push(task);
 
-  const ownerTarget = OWNER_PHONE || connectedNumber || "573018276980";
+  const ownerTarget = "lila_group";
   const createdReminders = [];
 
   // 1. Recordatorio 3 días antes (08:00 a.m.) - Solo si no ha pasado la hora hoy
@@ -863,17 +961,17 @@ const CLOUD_TOOLS_DECLARATIONS = [
   },
   {
     name: "send_or_reply_gmail",
-    description: "Envía un correo nuevo, responde al último correo recibido o reenvía un correo desde la cuenta Personal o Institucional de Uniguajira.",
+    description: "Envía un correo nuevo, responde a un correo recibido o reenvía un correo desde la cuenta Personal o Institucional de Uniguajira.",
     parameters: {
       type: "OBJECT",
       properties: {
-        to: { type: "STRING", description: "Dirección de correo del destinatario." },
-        subject: { type: "STRING", description: "Asunto del correo." },
+        to: { type: "STRING", description: "Dirección de correo del destinatario o nombre del remitente al que se responde." },
+        subject: { type: "STRING", description: "Asunto del correo (opcional si es respuesta)." },
         body: { type: "STRING", description: "Cuerpo del mensaje con ortografía impecable." },
         account: { type: "STRING", description: "'Personal' o 'Uniguajira' (por defecto Personal, o Uniguajira si es tema de la universidad)." },
-        isReply: { type: "BOOLEAN", description: "true si está respondiendo al último correo recibido." },
+        isReply: { type: "BOOLEAN", description: "true si está respondiendo a un correo leído recientemente." },
       },
-      required: ["to", "subject", "body"],
+      required: ["body"],
     },
   },
   {
@@ -899,14 +997,22 @@ const CLOUD_TOOLS_DECLARATIONS = [
     },
   },
   {
+    name: "get_scheduled_routines",
+    description: "Consulta las rutinas y mensajes programados activos en la memoria de LILA.",
+    parameters: {
+      type: "OBJECT",
+      properties: {},
+    },
+  },
+  {
     name: "schedule_whatsapp_message",
-    description: "Programa un mensaje de WhatsApp a un contacto a una hora determinada.",
+    description: "Programa un mensaje de WhatsApp a un contacto o grupo a una hora determinada.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: { type: "STRING", description: "Contacto (Paula, Pechy, Nelly, Perla) o número." },
-        message: { type: "STRING", description: "Texto a enviar." },
-        time: { type: "STRING", description: "Hora HH:MM." },
+        target: { type: "STRING", description: "Contacto (Paula, Pechy, Nelly, Perla), nombre de grupo o número." },
+        message: { type: "STRING", description: "Texto o instrucción de saludo a enviar." },
+        time: { type: "STRING", description: "Hora en formato 24h HH:MM (ej. '07:00')." },
         specificDate: { type: "STRING", description: "Fecha opcional YYYY-MM-DD." },
         recurring: { type: "BOOLEAN", description: "true solo si dijo 'todos los días'; false si es una sola vez." },
         useAI: { type: "BOOLEAN", description: "false si el mensaje fue dictado literal; true si pidió redactar un saludo." },
@@ -927,11 +1033,11 @@ const CLOUD_TOOLS_DECLARATIONS = [
   },
   {
     name: "send_whatsapp_message",
-    description: "Envía un mensaje de WhatsApp inmediatamente.",
+    description: "Envía un mensaje de WhatsApp inmediatamente a un contacto individual o a un grupo de WhatsApp.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: { type: "STRING", description: "Contacto (ej. Paula, Pechy, Nelly, Perla) o número." },
+        target: { type: "STRING", description: "Contacto (ej. Paula, Pechy, Nelly, Perla), nombre del grupo (ej. Cuarto gamer) o número." },
         message: { type: "STRING", description: "Texto a enviar." },
       },
       required: ["target", "message"],
@@ -946,6 +1052,21 @@ const CLOUD_TOOLS_DECLARATIONS = [
     },
   },
 ];
+
+function findMatchingEmailContext(targetHint = "") {
+  const list = Array.isArray(cloudState.recentFetchedEmails) ? cloudState.recentFetchedEmails : [];
+  const hint = String(targetHint || "").toLowerCase().trim();
+  if (hint) {
+    const matched = list.find(
+      (e) =>
+        (e.from && e.from.toLowerCase().includes(hint)) ||
+        (e.emailAddress && e.emailAddress.toLowerCase().includes(hint)) ||
+        (e.subject && e.subject.toLowerCase().includes(hint))
+    );
+    if (matched) return matched;
+  }
+  return cloudState.lastEmailContext || list[0] || null;
+}
 
 async function executeCloudToolCall(name, args) {
   switch (name) {
@@ -966,21 +1087,50 @@ async function executeCloudToolCall(name, args) {
     case "check_gmail":
       return await checkGmailLive(args?.query || "is:unread newer_than:2d", args?.account || "All");
     case "send_or_reply_gmail": {
+      let rawTo = String(args?.to || "").trim();
+      let matchedEmail = findMatchingEmailContext(rawTo);
+      let finalTo = rawTo;
+
+      // Extraer correo si viene como "Nombre <correo@dominio>" o buscar en el último correo leído si solo dieron el nombre ("Carlos")
+      const bracketMatch = rawTo.match(/<([^>]+@[^>]+)>/) || rawTo.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+      if (bracketMatch) {
+        finalTo = bracketMatch[1].trim();
+      } else if (!rawTo.includes("@") && matchedEmail) {
+        const ctxMatch =
+          (matchedEmail.emailAddress && matchedEmail.emailAddress.includes("@") ? matchedEmail.emailAddress : null) ||
+          matchedEmail.from?.match(/<([^>]+@[^>]+)>/)?.[1] ||
+          matchedEmail.from?.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/)?.[1];
+        if (ctxMatch) finalTo = ctxMatch.trim();
+      }
+
+      if (!finalTo || !finalTo.includes("@")) {
+        return `No se encontró una dirección de correo válida para '${rawTo || "el destinatario"}'. Por favor indique el correo electrónico.`;
+      }
+
+      const isReply = Boolean(args?.isReply) || (!rawTo.includes("@") && Boolean(matchedEmail));
       let threadId = null;
       let inReplyTo = null;
-      if (args.isReply && cloudState.lastEmailContext) {
-        threadId = cloudState.lastEmailContext.threadId;
-        inReplyTo = cloudState.lastEmailContext.messageIdHeader;
+      let finalSubject = String(args?.subject || "").trim();
+
+      if (isReply && matchedEmail) {
+        threadId = matchedEmail.threadId || null;
+        inReplyTo = matchedEmail.messageIdHeader || null;
+        if (!finalSubject && matchedEmail.subject) {
+          finalSubject = /^re:/i.test(matchedEmail.subject) ? matchedEmail.subject : `Re: ${matchedEmail.subject}`;
+        }
       }
+      if (!finalSubject) finalSubject = "Mensaje del Señor Carlos";
+
+      const accountToUse = args?.account || matchedEmail?.account || "Personal";
       const sent = await sendOrReplyGmail({
-        to: args.to,
-        subject: args.subject,
-        body: args.body,
-        account: args.account || "Personal",
+        to: finalTo,
+        subject: finalSubject,
+        body: String(args?.body || ""),
+        account: accountToUse,
         inReplyTo,
         threadId,
       });
-      return `Correo enviado exitosamente a ${sent.to} desde la cuenta ${sent.account} con el asunto "${args.subject}".`;
+      return `Correo enviado exitosamente a ${sent.to} desde la cuenta ${sent.account} con el asunto "${finalSubject}".`;
     }
     case "add_agenda_event": {
       const { task, createdReminders } = createAgendaEventWithReminders({
@@ -990,31 +1140,71 @@ async function executeCloudToolCall(name, args) {
         notes: args.notes || "",
       });
       const remsText = createdReminders.length > 0 ? createdReminders.join(", ") : "notificación el mismo día";
-      return `Evento '${task.title}' registrado exitosamente en la agenda para el ${task.dueDate}. Recordatorios automáticos programados en WhatsApp: ${remsText}.`;
+      return `Evento '${task.title}' registrado exitosamente en la agenda para el ${task.dueDate}. Recordatorios automáticos programados en el grupo LILA: ${remsText}.`;
     }
     case "get_pending_tasks":
       return getPendingTasksSummary();
+    case "get_scheduled_routines": {
+      const activeList = schedules.filter((s) => s.active && !s.parentEventId);
+      if (activeList.length === 0) {
+        return "Actualmente no hay rutinas automáticas programadas.";
+      }
+      const lines = activeList.map(
+        (s) =>
+          `- Para: *${s.contactName || s.target}* | Hora: *${s.time}* (${
+            s.recurring ? "Todos los días" : s.specificDate || "Una vez"
+          }) | Mensaje/Instrucción: "${s.message}"${s.pauseUntil ? ` [Pausada hasta ${s.pauseUntil}]` : ""}`
+      );
+      return `Rutinas activas programadas (${activeList.length}):\n` + lines.join("\n");
+    }
     case "schedule_whatsapp_message": {
-      const resolved = resolveContactTarget(args.target);
+      const resolved = await resolveContactTargetAsync(args.target);
       if (!resolved.ok && resolved.ambiguous) return resolved.error;
-      const targetStr = resolved.ok ? resolved.jid.split("@")[0] : args.target;
+      const targetStr = resolved.ok
+        ? resolved.jid.endsWith("@g.us")
+          ? resolved.jid
+          : resolved.jid.split("@")[0]
+        : args.target;
+
+      const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
+      const cleanTime = String(args.time || "07:00").trim().padStart(5, "0");
+      const isRecurring = Boolean(args.recurring);
+      let specificDate = args.specificDate ? String(args.specificDate).trim() : null;
+      let initialLastSentDate = null;
+
+      // REGLA ANTI-ENVÍO NOCTURNO: Si la hora programada hoy ya pasó (ej. son las 21:16 y programa para las 07:00),
+      // jamás enviarlo ahora mismo: marcarlo como ya cubierto hoy para que inicie mañana a su hora exacta.
+      if (!specificDate && cleanTime <= currentHHMM) {
+        if (isRecurring) {
+          initialLastSentDate = todayStr;
+        } else {
+          specificDate = addDaysToDateStr(todayStr, 1);
+        }
+      }
+
       const newItem = {
         id: Date.now().toString(36),
         target: targetStr,
         contactName: resolved.canonicalName || args.target,
         message: args.message,
-        time: args.time,
-        specificDate: args.specificDate || null,
-        recurring: Boolean(args.recurring),
+        time: cleanTime,
+        specificDate,
+        recurring: isRecurring,
         useAI: Boolean(args.useAI),
         pauseUntil: null,
         active: true,
-        lastSentDate: null,
+        lastSentDate: initialLastSentDate,
       };
       schedules.push(newItem);
       saveSchedules();
-      return `Rutina programada exitosamente para '${newItem.contactName}' a las ${newItem.time} (${
-        newItem.recurring ? "todos los días" : newItem.specificDate ? `el ${newItem.specificDate}` : "una sola vez"
+      const startInfo =
+        initialLastSentDate === todayStr
+          ? `iniciando mañana a las ${cleanTime}`
+          : specificDate
+          ? `para el ${specificDate} a las ${cleanTime}`
+          : `a las ${cleanTime}`;
+      return `Rutina programada exitosamente para '${newItem.contactName}' ${startInfo} (${
+        newItem.recurring ? "todos los días" : "una sola vez"
       }).`;
     }
     case "pause_or_cancel_routine": {
@@ -1036,10 +1226,10 @@ async function executeCloudToolCall(name, args) {
         : `Se cancelaron ${count} rutina(s).`;
     }
     case "send_whatsapp_message": {
-      const resolved = resolveContactTarget(args.target);
+      const resolved = await resolveContactTargetAsync(args.target);
       if (!resolved.ok) return resolved.error;
       await safeSendMessage(resolved.jid, { text: String(args.message) });
-      return `Mensaje enviado a ${resolved.canonicalName}: "${args.message}"`;
+      return `Mensaje enviado exitosamente a '${resolved.canonicalName}': "${args.message}"`;
     }
     default:
       return `Herramienta ${name} no reconocida.`;
@@ -1187,6 +1377,25 @@ async function callGeminiWithFallback(
           continue;
         }
 
+        // Guardia anti-alucinación: si la IA afirma haber enviado/respondido un correo sin haber llamado a send_or_reply_gmail
+        const claimedEmailSent =
+          /he respondido al correo|he enviado el correo|correo.*ha sido enviado|respond[ií] al correo/i.test(stepText);
+        if (enableTools && claimedEmailSent && !calledTools.has("send_or_reply_gmail")) {
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts: [{ text: stepText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `[SISTEMA: Aún NO has ejecutado la herramienta 'send_or_reply_gmail'. Invoca 'send_or_reply_gmail' AHORA MISMO con el cuerpo del mensaje para que el correo se envíe realmente antes de confirmar al Señor Carlos.]`,
+                },
+              ],
+            },
+          ];
+          continue;
+        }
+
         if (stepText) return { ok: true, text: stepText };
         if (lastToolResultsSummary) return { ok: true, text: lastToolResultsSummary };
         break;
@@ -1209,17 +1418,21 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
     ? `Ubicación conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
     : "Ciudades habituales del Señor Carlos: Riohacha y Hatonuevo (La Guajira, Colombia).";
 
+  const lastMailInfo = cloudState.lastEmailContext
+    ? `\n9. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (para responder con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
+    : "";
+
   const systemPrompt =
     "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
     "=== REGLAS DE IDENTIDAD Y ACCIÓN INQUEBRANTABLES ===\n" +
     "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google. Tu creador es el Señor Carlos.\n" +
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
     "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
-    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos dice que tiene algo para cierto día (ej. 'para el viernes tengo exposición y laboratorio'), agenda DE INMEDIATO con `add_agenda_event` calculando la fecha exacta. Si pregunta qué tiene pendiente ('¿qué tengo pendiente?'), invoca `get_pending_tasks`.\n" +
-    "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira.\n" +
-    "6. ÓRDENES MÚLTIPLES: Si el Señor Carlos pide dos o más cosas en un mismo mensaje (ej. 'dame informe de pendientes y también revisa mi correo'), invoca TODAS las herramientas necesarias (`get_pending_tasks` y `check_gmail`) para entregar la respuesta completa.\n" +
+    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos dice que tiene algo para cierto día (ej. 'para el viernes tengo exposición y laboratorio'), agenda DE INMEDIATO con `add_agenda_event` calculando la fecha exacta. Si pregunta qué tiene pendiente ('¿qué tengo pendiente?'), invoca `get_pending_tasks`. Si pregunta qué rutinas tiene programadas, invoca `get_scheduled_routines`.\n" +
+    "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira. NUNCA digas que enviaste o respondiste un correo sin haber invocado `send_or_reply_gmail`.\n" +
+    "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en un grupo de WhatsApp (ej. 'Cuarto gamer'), invoca DE INMEDIATO `send_whatsapp_message` con el nombre del grupo en `target`.\n" +
     "7. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
-    `8. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}`;
+    `8. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${lastMailInfo}`;
 
   const history = chatHistoryByJid.get(jid) || [];
   const geminiContents = [
@@ -1334,6 +1547,9 @@ async function startWhatsApp() {
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
       console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
       scheduleSyncAuthToMongo(500);
+      setTimeout(() => {
+        syncWhatsAppGroups().catch(() => {});
+      }, 2500);
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
@@ -1398,6 +1614,9 @@ async function startWhatsApp() {
 
       const isCommandForLila = /^lila[,:\s]+/i.test(cleanText);
       if (isCommandForLila && isOwnerOrSelf) {
+        if (remoteJid.endsWith("@g.us") && !cloudState.lilaNotificationGroupJid) {
+          syncWhatsAppGroups().catch(() => {});
+        }
         const query = cleanText.replace(/^lila[,:\s]+/i, "").trim();
         if (query) {
           const historyKey = remoteJid || "owner_self";
@@ -1427,6 +1646,15 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function isTimeWithinMinutesWindow(targetHHMM, currentHHMM, maxWindowMinutes = 30) {
+  const [th, tm] = String(targetHHMM || "00:00").split(":").map(Number);
+  const [ch, cm] = String(currentHHMM || "00:00").split(":").map(Number);
+  if (Number.isNaN(th) || Number.isNaN(tm) || Number.isNaN(ch) || Number.isNaN(cm)) return false;
+  const targetMins = th * 60 + tm;
+  const currentMins = ch * 60 + cm;
+  return currentMins >= targetMins && currentMins - targetMins <= maxWindowMinutes;
+}
+
 // --- EVALUADOR DE RUTINAS Y RECORDATORIOS ESCALONADOS (Evita horas pasadas) ---
 async function evaluateSchedules() {
   if (connectionStatus !== "connected" || !sock) return;
@@ -1444,8 +1672,13 @@ async function evaluateSchedules() {
 
     if (item.specificDate && item.specificDate !== todayStr) continue;
 
-    if (item.time <= currentHHMM && item.lastSentDate !== todayStr) {
-      const jid = toWhatsAppJid(item.target);
+    // Solo dispara si estamos dentro de la ventana de 30 minutos de la hora programada (nunca horas después en la noche)
+    if (isTimeWithinMinutesWindow(item.time, currentHHMM, 30) && item.lastSentDate !== todayStr) {
+      const isOwnerNotification =
+        Boolean(item.parentEventId) ||
+        item.target === "lila_group" ||
+        (OWNER_PHONE && String(item.target).includes(OWNER_PHONE));
+      const jid = isOwnerNotification ? getOwnerNotificationJid() : toWhatsAppJid(item.target);
       if (!jid) continue;
 
       let finalMessage = item.message;
@@ -1467,11 +1700,14 @@ async function evaluateSchedules() {
   if (changed) saveSchedules();
 }
 
-// Vigía proactivo de Gmail en la nube
+// Vigía proactivo de Gmail en la nube (Envía notificaciones al grupo LILA)
 async function pollGmailProactively() {
   if (connectionStatus !== "connected" || !sock) return;
-  const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
-  if (!ownerJid) return;
+  if (!cloudState.lilaNotificationGroupJid) {
+    await syncWhatsAppGroups();
+  }
+  const notifyJid = getOwnerNotificationJid();
+  if (!notifyJid) return;
 
   const accounts = [];
   const pCreds = resolveGmailAccountCreds("Personal");
@@ -1488,6 +1724,11 @@ async function pollGmailProactively() {
             cloudState.notifiedEmailIds.push(email.id);
             if (cloudState.notifiedEmailIds.length > 100) cloudState.notifiedEmailIds.shift();
             cloudState.lastEmailContext = email;
+            if (!Array.isArray(cloudState.recentFetchedEmails)) cloudState.recentFetchedEmails = [];
+            cloudState.recentFetchedEmails = [
+              email,
+              ...cloudState.recentFetchedEmails.filter((x) => x.id !== email.id),
+            ].slice(0, 20);
             saveCloudState();
 
             recentEmails.push({ from: email.from, subject: email.subject, snippet: email.snippet, account: accName, time: new Date().toISOString() });
@@ -1498,7 +1739,7 @@ async function pollGmailProactively() {
               "routine",
               false
             );
-            await safeSendMessage(ownerJid, {
+            await safeSendMessage(notifyJid, {
               text: `📧 *Nuevo Correo (${accName})*\n*De:* ${email.from}\n*Asunto:* ${email.subject}\n\n🤖 *LILA:* ${summary}`,
             });
           }
@@ -1599,7 +1840,7 @@ app.post("/send", requireAuth, async (req, res) => {
     const target = req.body.contact || req.body.number;
     const message = req.body.message;
     if (!target || !message) return res.status(400).json({ success: false, error: "Faltan parámetros." });
-    const resolved = resolveContactTarget(target);
+    const resolved = await resolveContactTargetAsync(target);
     if (!resolved.ok) return res.status(400).json({ success: false, ambiguous: Boolean(resolved.ambiguous), error: resolved.error });
     await safeSendMessage(resolved.jid, { text: String(message) });
     return res.json({ success: true, to: resolved.jid, contactName: resolved.canonicalName });
@@ -1608,23 +1849,38 @@ app.post("/send", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/schedule", requireAuth, (req, res) => {
+app.post("/schedule", requireAuth, async (req, res) => {
   const { target, message, time, specificDate = null, recurring = false, useAI = false } = req.body;
   if (!target || !message || !time) return res.status(400).json({ success: false, error: "Faltan parámetros." });
-  const resolved = resolveContactTarget(target);
+  const resolved = await resolveContactTargetAsync(target);
   if (!resolved.ok && resolved.ambiguous) return res.status(400).json({ success: false, ambiguous: true, error: resolved.error });
+
+  const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
+  const cleanTime = String(time || "07:00").trim().padStart(5, "0");
+  const isRecurring = Boolean(recurring);
+  let finalDate = specificDate || null;
+  let initialLastSentDate = null;
+
+  if (!finalDate && cleanTime <= currentHHMM) {
+    if (isRecurring) {
+      initialLastSentDate = todayStr;
+    } else {
+      finalDate = addDaysToDateStr(todayStr, 1);
+    }
+  }
+
   const newItem = {
     id: Date.now().toString(36),
-    target: resolved.ok ? resolved.jid.split("@")[0] : target,
+    target: resolved.ok ? (resolved.jid.endsWith("@g.us") ? resolved.jid : resolved.jid.split("@")[0]) : target,
     contactName: resolved.canonicalName || target,
     message,
-    time,
-    specificDate: specificDate || null,
-    recurring: Boolean(recurring),
+    time: cleanTime,
+    specificDate: finalDate,
+    recurring: isRecurring,
     useAI: Boolean(useAI),
     pauseUntil: null,
     active: true,
-    lastSentDate: null,
+    lastSentDate: initialLastSentDate,
   };
   schedules.push(newItem);
   saveSchedules();
@@ -1660,15 +1916,18 @@ app.post("/gmail-alert", requireAuth, async (req, res) => {
     recentEmails.push({ from, subject, snippet, account, time: new Date().toISOString() });
     if (recentEmails.length > 20) recentEmails.shift();
 
-    const ownerJid = toWhatsAppJid(OWNER_PHONE || connectedNumber);
-    if (!ownerJid || connectionStatus !== "connected" || !sock) return res.status(503).json({ success: false });
+    if (!cloudState.lilaNotificationGroupJid) {
+      await syncWhatsAppGroups();
+    }
+    const notifyJid = getOwnerNotificationJid();
+    if (!notifyJid || connectionStatus !== "connected" || !sock) return res.status(503).json({ success: false });
 
     const summary = await askLilaCloudAI(
       `Llegó un correo nuevo a '${account}'.\nDe: ${from}\nAsunto: ${subject}\nContenido: ${snippet}\nHaz un aviso de máximo 2 líneas con ortografía impecable.`,
       "routine",
       false
     );
-    await safeSendMessage(ownerJid, { text: `📧 *Nuevo Correo (${account})*\n*De:* ${from}\n*Asunto:* ${subject}\n\n🤖 *LILA:* ${summary}` });
+    await safeSendMessage(notifyJid, { text: `📧 *Nuevo Correo (${account})*\n*De:* ${from}\n*Asunto:* ${subject}\n\n🤖 *LILA:* ${summary}` });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
