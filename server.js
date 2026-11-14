@@ -199,6 +199,24 @@ async function saveSchedules() {
 }
 
 // --- PERSISTENCIA TOTAL DE LA SESIÓN DE WHATSAPP EN MONGODB ---
+let syncAuthTimeout = null;
+function scheduleSyncAuthToMongo(delayMs = 1500) {
+  if (syncAuthTimeout) clearTimeout(syncAuthTimeout);
+  syncAuthTimeout = setTimeout(() => {
+    syncAllAuthToMongo().catch(() => {});
+  }, delayMs);
+}
+
+async function clearAuthFromMongo() {
+  if (!isMongoConnected || !mongoDb) return;
+  try {
+    await mongoDb.collection("whatsapp_auth").deleteMany({});
+    console.log("[LILA] 🍃 Sesión de WhatsApp limpiada en MongoDB.");
+  } catch (err) {
+    console.error("Error limpiando sesión en MongoDB:", err.message);
+  }
+}
+
 async function restoreAuthFromMongo() {
   if (!isMongoConnected || !mongoDb) return;
   try {
@@ -222,11 +240,14 @@ async function restoreAuthFromMongo() {
 async function syncAllAuthToMongo() {
   if (!isMongoConnected || !mongoDb || !fs.existsSync(AUTH_FOLDER)) return;
   try {
-    const col = mongoDb.collection("whatsapp_auth");
     const files = fs.readdirSync(AUTH_FOLDER);
+    if (!files.includes("creds.json")) return;
+    const col = mongoDb.collection("whatsapp_auth");
+    const currentFileNames = [];
     for (const file of files) {
       const fullPath = path.join(AUTH_FOLDER, file);
       if (fs.statSync(fullPath).isFile()) {
+        currentFileNames.push(file);
         const content = fs.readFileSync(fullPath, "utf-8");
         await col.updateOne(
           { fileName: file },
@@ -235,7 +256,10 @@ async function syncAllAuthToMongo() {
         );
       }
     }
-    console.log(`[LILA] 🍃 Sesión de WhatsApp respaldada en MongoDB (${files.length} archivos).`);
+    if (currentFileNames.length > 0) {
+      await col.deleteMany({ fileName: { $nin: currentFileNames } });
+    }
+    console.log(`[LILA] 🍃 Sesión de WhatsApp respaldada en MongoDB (${currentFileNames.length} archivos).`);
   } catch (err) {
     console.error("Error respaldando sesión en MongoDB:", err.message);
   }
@@ -1022,8 +1046,14 @@ async function executeCloudToolCall(name, args) {
   }
 }
 
-// --- LLAMADA A GEMINI CON FUNCTION CALLING ---
-async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools = false) {
+// --- LLAMADA A GEMINI CON FUNCTION CALLING MULTIPASO Y AVISOS INTERMEDIOS ---
+async function callGeminiWithFallback(
+  systemPrompt,
+  geminiContents,
+  enableTools = false,
+  onProgress = null,
+  userPromptText = ""
+) {
   if (!GEMINI_API_KEY) return { ok: false, error: "Sin GEMINI_API_KEY" };
   const modelsToTry = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"];
   let lastError = "";
@@ -1032,67 +1062,139 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
     const modelName = modelsToTry[i];
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-      const payload = {
-        systemInstruction: { parts: [{ text: systemPrompt }] },
-        contents: [...geminiContents],
-      };
-      if (enableTools) {
-        payload.tools = [{ functionDeclarations: CLOUD_TOOLS_DECLARATIONS }];
-      }
+      let currentContents = [...geminiContents];
+      const calledTools = new Set();
+      let lastToolResultsSummary = "";
 
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!res.ok) {
-        const errBody = await res.text();
-        lastError = `Gemini (${modelName}) HTTP ${res.status}: ${errBody.slice(0, 100)}`;
-        if (res.status === 503 || res.status === 429) await sleep(1200);
-        continue;
-      }
-
-      const data = await res.json();
-      const parts = data?.candidates?.[0]?.content?.parts || [];
-      const fnCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
-
-      if (fnCalls.length > 0) {
-        const toolResponseParts = [];
-        for (const fc of fnCalls) {
-          const toolResult = await executeCloudToolCall(fc.name, fc.args || {});
-          toolResponseParts.push({
-            functionResponse: { name: fc.name, response: { result: toolResult } },
-          });
+      for (let step = 0; step < 5; step++) {
+        const payload = {
+          systemInstruction: { parts: [{ text: systemPrompt }] },
+          contents: currentContents,
+        };
+        if (enableTools) {
+          payload.tools = [{ functionDeclarations: CLOUD_TOOLS_DECLARATIONS }];
         }
 
-        const followUpContents = [
-          ...geminiContents,
-          { role: "model", parts },
-          { role: "user", parts: toolResponseParts },
-        ];
-
-        const res2 = await fetch(url, {
+        const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: systemPrompt }] },
-            contents: followUpContents,
-            tools: [{ functionDeclarations: CLOUD_TOOLS_DECLARATIONS }],
-          }),
+          body: JSON.stringify(payload),
         });
 
-        if (res2.ok) {
-          const data2 = await res2.json();
-          const finalText = (data2?.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("\n").trim();
-          if (finalText) return { ok: true, text: finalText };
+        if (!res.ok) {
+          const errBody = await res.text();
+          lastError = `Gemini (${modelName}) HTTP ${res.status}: ${errBody.slice(0, 100)}`;
+          if (res.status === 503 || res.status === 429) await sleep(1200);
+          break;
         }
-        const directSummary = toolResponseParts.map((tr) => tr.functionResponse.response.result).join("\n");
-        return { ok: true, text: directSummary };
+
+        const data = await res.json();
+        const parts = data?.candidates?.[0]?.content?.parts || [];
+        const stepText = parts.map((p) => p.text || "").join("\n").trim();
+        const fnCalls = parts.filter((p) => p.functionCall).map((p) => p.functionCall);
+
+        if (fnCalls.length > 0) {
+          // Si LILA emite un mensaje intermedio ("Ahora, déjeme revisar su correo...") mientras ejecuta otra herramienta, enviarlo en vivo
+          if (stepText && onProgress) {
+            try {
+              await onProgress(stepText);
+            } catch (_) {}
+          }
+
+          const toolResponseParts = [];
+          for (const fc of fnCalls) {
+            calledTools.add(fc.name);
+            const toolResult = await executeCloudToolCall(fc.name, fc.args || {});
+            toolResponseParts.push({
+              functionResponse: { name: fc.name, response: { result: toolResult } },
+            });
+          }
+          lastToolResultsSummary = toolResponseParts.map((tr) => tr.functionResponse.response.result).join("\n");
+
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts },
+            { role: "user", parts: toolResponseParts },
+          ];
+          continue;
+        }
+
+        // Si el modelo prometió revisar el correo/agenda/clima en texto ("Ahora, déjeme revisar...") pero olvidó adjuntar el functionCall
+        const combinedContext = `${userPromptText} ${stepText}`.toLowerCase();
+        const promisedFollowUp =
+          /d[eé]jeme revisar|voy a revisar|ahora revisar[eé]|procedo a revisar|consultando su|revisando su|un momento mientras/i.test(
+            stepText
+          );
+
+        if (
+          enableTools &&
+          promisedFollowUp &&
+          /correo|gmail|bandeja|email/i.test(combinedContext) &&
+          !calledTools.has("check_gmail")
+        ) {
+          if (stepText && onProgress) {
+            try {
+              await onProgress(stepText);
+            } catch (_) {}
+          }
+          calledTools.add("check_gmail");
+          const gmailResult = await executeCloudToolCall("check_gmail", {
+            query: "is:unread newer_than:2d",
+            account: "All",
+          });
+          lastToolResultsSummary = gmailResult;
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts: [{ text: stepText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `[SISTEMA: Resultado real de check_gmail ejecutado inmediatamente]:\n${gmailResult}\n\nEntrega ahora mismo el informe detallado de los correos al Señor Carlos.`,
+                },
+              ],
+            },
+          ];
+          continue;
+        }
+
+        if (
+          enableTools &&
+          promisedFollowUp &&
+          /pendiente|agenda|tarea|compromiso/i.test(combinedContext) &&
+          !calledTools.has("get_pending_tasks")
+        ) {
+          if (stepText && onProgress) {
+            try {
+              await onProgress(stepText);
+            } catch (_) {}
+          }
+          calledTools.add("get_pending_tasks");
+          const tasksResult = await executeCloudToolCall("get_pending_tasks", {});
+          lastToolResultsSummary = tasksResult;
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts: [{ text: stepText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `[SISTEMA: Resultado real de get_pending_tasks ejecutado inmediatamente]:\n${tasksResult}\n\nEntrega ahora mismo el informe de tareas pendientes al Señor Carlos.`,
+                },
+              ],
+            },
+          ];
+          continue;
+        }
+
+        if (stepText) return { ok: true, text: stepText };
+        if (lastToolResultsSummary) return { ok: true, text: lastToolResultsSummary };
+        break;
       }
 
-      const text = parts.map((p) => p.text || "").join("\n").trim();
-      if (text) return { ok: true, text };
+      if (lastToolResultsSummary) {
+        return { ok: true, text: lastToolResultsSummary };
+      }
     } catch (e) {
       lastError = `Gemini (${modelName}) Error: ${e.message}`;
     }
@@ -1101,7 +1203,7 @@ async function callGeminiWithFallback(systemPrompt, geminiContents, enableTools 
 }
 
 // --- CEREBRO CONVERSACIONAL DE LILA EN LA NUBE ---
-async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
+async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, onProgress = null) {
   const { dateStr, timeStr, readable } = getColombiaNowParts();
   const locStr = cloudState.currentLocation?.placeName
     ? `Ubicación conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
@@ -1115,8 +1217,9 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
     "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
     "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos dice que tiene algo para cierto día (ej. 'para el viernes tengo exposición y laboratorio'), agenda DE INMEDIATO con `add_agenda_event` calculando la fecha exacta. Si pregunta qué tiene pendiente ('¿qué tengo pendiente?'), invoca `get_pending_tasks`.\n" +
     "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira.\n" +
-    "6. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
-    `7. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}`;
+    "6. ÓRDENES MÚLTIPLES: Si el Señor Carlos pide dos o más cosas en un mismo mensaje (ej. 'dame informe de pendientes y también revisa mi correo'), invoca TODAS las herramientas necesarias (`get_pending_tasks` y `check_gmail`) para entregar la respuesta completa.\n" +
+    "7. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
+    `8. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}`;
 
   const history = chatHistoryByJid.get(jid) || [];
   const geminiContents = [
@@ -1124,7 +1227,7 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true) {
     { role: "user", parts: [{ text: userPrompt }] },
   ];
 
-  const gemRes = await callGeminiWithFallback(systemPrompt, geminiContents, allowTools);
+  const gemRes = await callGeminiWithFallback(systemPrompt, geminiContents, allowTools, onProgress, userPrompt);
   if (gemRes.ok && gemRes.text) {
     if (jid !== "routine") {
       history.push({ role: "user", text: userPrompt });
@@ -1182,6 +1285,11 @@ async function generateSafeRoutineMessage(target, instruction) {
 // --- INICIALIZACIÓN DE WHATSAPP (Baileys) - NUNCA BORRA SESIONES SIGNAL ---
 async function startWhatsApp() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const origKeysSet = state.keys.set.bind(state.keys);
+  state.keys.set = async (data) => {
+    await origKeysSet(data);
+    scheduleSyncAuthToMongo(1500);
+  };
   const { version } = await fetchLatestBaileysVersion();
 
   sock = makeWASocket({
@@ -1210,7 +1318,7 @@ async function startWhatsApp() {
 
   sock.ev.on("creds.update", async () => {
     await saveCreds();
-    syncAllAuthToMongo().catch(() => {});
+    scheduleSyncAuthToMongo(500);
   });
 
   sock.ev.on("connection.update", async (update) => {
@@ -1225,17 +1333,21 @@ async function startWhatsApp() {
       latestQrDataUrl = null;
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
       console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
-      syncAllAuthToMongo().catch(() => {});
+      scheduleSyncAuthToMongo(500);
     }
     if (connection === "close") {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
       connectionStatus = "disconnected";
       console.log(`[LILA] Desconectado (${statusCode}). Reconectando: ${shouldReconnect}`);
-      syncAllAuthToMongo().catch(() => {});
       if (shouldReconnect) {
+        scheduleSyncAuthToMongo(500);
         setTimeout(startWhatsApp, 3500);
       } else {
+        if (fs.existsSync(AUTH_FOLDER)) {
+          fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+        }
+        await clearAuthFromMongo();
         setTimeout(startWhatsApp, 2000);
       }
     }
@@ -1289,8 +1401,15 @@ async function startWhatsApp() {
         const query = cleanText.replace(/^lila[,:\s]+/i, "").trim();
         if (query) {
           const historyKey = remoteJid || "owner_self";
-          const reply = await askLilaCloudAI(query, historyKey, true);
-          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply}` }, { quoted: msg });
+          const sendIntermediate = async (partialText) => {
+            if (partialText && partialText.trim()) {
+              await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
+            }
+          };
+          const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
+          if (reply && reply.trim()) {
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
+          }
         }
       }
     }
@@ -1407,6 +1526,11 @@ app.get("/ping", async (req, res) => {
     service: "LILA Cloud",
     whatsapp: connectionStatus,
     connectedNumber,
+    mongoConnected: isMongoConnected,
+    gmailSynced: {
+      Personal: Boolean(cloudState.gmailOAuth?.Personal),
+      Uniguajira: Boolean(cloudState.gmailOAuth?.Uniguajira),
+    },
     activeTasksCount: cloudState.agendaTasks.filter((t) => !t.completed).length,
     activeSchedulesCount: schedules.filter((s) => s.active).length,
   });
@@ -1591,6 +1715,7 @@ app.get("/reset-session", requireAuth, async (req, res) => {
     if (fs.existsSync(AUTH_FOLDER)) {
       fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
     }
+    await clearAuthFromMongo();
     sentMessagesCache.clear();
     connectionStatus = "initializing";
     setTimeout(startWhatsApp, 2000);
