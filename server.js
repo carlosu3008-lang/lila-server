@@ -103,6 +103,7 @@ let cloudState = {
   lastEmailContext: null,
   recentFetchedEmails: [],
   lilaNotificationGroupJid: null,
+  guestModeEnabled: true,
 };
 
 try {
@@ -137,6 +138,7 @@ async function loadStateFromMongo() {
         lastEmailContext: doc.lastEmailContext || cloudState.lastEmailContext,
         recentFetchedEmails: Array.isArray(doc.recentFetchedEmails) ? doc.recentFetchedEmails : cloudState.recentFetchedEmails,
         lilaNotificationGroupJid: doc.lilaNotificationGroupJid || cloudState.lilaNotificationGroupJid,
+        guestModeEnabled: typeof doc.guestModeEnabled === "boolean" ? doc.guestModeEnabled : cloudState.guestModeEnabled,
       };
       console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
     }
@@ -1474,6 +1476,54 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
   return `Señor Carlos, el nodo en la nube está activo pero los proveedores de IA devolvieron error temporal (${gemRes.error || "sin respuesta"}).`;
 }
 
+// --- MODO INVITADO SEGURO (CERO HERRAMIENTAS PRIVADAS + LÍMITE DE 4 MSJS/HORA) ---
+const guestRateLimitMap = new Map();
+const GUEST_MAX_MSGS_PER_HOUR = 4;
+
+function checkGuestRateLimit(senderKey) {
+  const now = Date.now();
+  const oneHourMs = 60 * 60 * 1000;
+  let record = guestRateLimitMap.get(senderKey);
+  if (!record || now - record.windowStart > oneHourMs) {
+    record = { count: 1, windowStart: now };
+    guestRateLimitMap.set(senderKey, record);
+    return { allowed: true, count: 1 };
+  }
+  record.count += 1;
+  guestRateLimitMap.set(senderKey, record);
+  if (record.count <= GUEST_MAX_MSGS_PER_HOUR) {
+    return { allowed: true, count: record.count };
+  }
+  return {
+    allowed: false,
+    limitJustReached: record.count === GUEST_MAX_MSGS_PER_HOUR + 1,
+    count: record.count,
+  };
+}
+
+async function askLilaGuestAI(guestQuery, guestName = "Invitado", jid = "guest") {
+  const { dateStr, timeStr, readable } = getColombiaNowParts();
+  const guestPrompt =
+    "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
+    `Estás en MODO INVITADO conversando con '${guestName}' (un amigo o compañero del Señor Carlos en WhatsApp).\n` +
+    "=== REGLAS INQUEBRANTABLES DE MODO INVITADO ===\n" +
+    "1. Tu único nombre es LILA y tu único creador es el Señor Carlos. Nunca menciones a Google ni a J.A.R.V.I.S.\n" +
+    `2. Dirígete a '${guestName}' por su nombre con amabilidad, carisma e inteligencia, con ortografía impecable en español y en MÁXIMO 3 líneas.\n` +
+    "3. Puedes responder preguntas de estudio, cultura general, programación o seguir una conversación amistosa.\n" +
+    "4. BLOQUEO TOTAL DE FUNCIONES PRIVADAS: Tienes estrictamente PROHIBIDO leer o enviar correos, enviar mensajes a otros chats, programar rutinas, modificar la agenda o revelar información privada del Señor Carlos. Si te piden hacer algo de eso, responde con elegancia que tus funciones privadas y de control solo obedecen órdenes directas de tu creador, el Señor Carlos.\n" +
+    `5. Fecha y hora actual en Colombia: ${readable} (${dateStr}), ${timeStr}.`;
+
+  const gemRes = await callGeminiWithFallback(
+    guestPrompt,
+    [{ role: "user", parts: [{ text: `[Mensaje de ${guestName}]: ${guestQuery}` }] }],
+    false
+  );
+  if (gemRes.ok && gemRes.text) {
+    return gemRes.text;
+  }
+  return `¡Hola, ${guestName}! Soy LILA, el asistente personal del Señor Carlos. En este momento estoy en modo de espera.`;
+}
+
 // --- GENERADOR CON ESTILO PERSONAL PARA RUTINAS HACIA CONTACTOS ---
 async function generateSafeRoutineMessage(target, instruction) {
   const targetLower = String(target || "").toLowerCase();
@@ -1580,11 +1630,16 @@ async function startWhatsApp() {
       const remoteJid = msg.key.remoteJid || "";
       if (remoteJid === "status@broadcast") continue;
 
+      const participantJid = msg.key.participant || "";
+      const isGroup = remoteJid.endsWith("@g.us");
       const isOwnerOrSelf =
-        msg.key.fromMe ||
-        (OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
-        (connectedNumber && remoteJid.includes(connectedNumber)) ||
-        remoteJid.endsWith("@lid");
+        Boolean(msg.key.fromMe) ||
+        Boolean(OWNER_PHONE && participantJid.includes(OWNER_PHONE)) ||
+        Boolean(connectedNumber && participantJid.includes(connectedNumber)) ||
+        (!isGroup &&
+          ((OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
+            (connectedNumber && remoteJid.includes(connectedNumber)) ||
+            remoteJid.endsWith("@lid")));
 
       const text =
         msg.message.conversation ||
@@ -1593,7 +1648,7 @@ async function startWhatsApp() {
         "";
       if (!text) continue;
 
-      const pushName = msg.pushName || remoteJid.split("@")[0];
+      const pushName = msg.pushName || (participantJid ? participantJid.split("@")[0] : remoteJid.split("@")[0]);
       const { timeStr: nowCol } = getColombiaNowParts();
 
       if (!msg.key.fromMe && pushName && remoteJid.endsWith("@s.whatsapp.net")) {
@@ -1612,24 +1667,79 @@ async function startWhatsApp() {
       const cleanText = text.trim();
       if (cleanText.startsWith("🤖 *LILA:*")) continue;
 
-      const isCommandForLila = /^lila[,:\s]+/i.test(cleanText);
-      if (isCommandForLila && isOwnerOrSelf) {
-        if (remoteJid.endsWith("@g.us") && !cloudState.lilaNotificationGroupJid) {
+      const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
+      if (!isCommandForLila) continue;
+
+      const rawQuery = cleanText.replace(/^lila[,:\s]*/i, "").trim();
+
+      // --- NIVEL 1: MODO CREADOR (SOLO SEÑOR CARLOS) ---
+      if (isOwnerOrSelf) {
+        if (isGroup && !cloudState.lilaNotificationGroupJid) {
           syncWhatsAppGroups().catch(() => {});
         }
-        const query = cleanText.replace(/^lila[,:\s]+/i, "").trim();
-        if (query) {
-          const historyKey = remoteJid || "owner_self";
-          const sendIntermediate = async (partialText) => {
-            if (partialText && partialText.trim()) {
-              await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
-            }
-          };
-          const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
-          if (reply && reply.trim()) {
-            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
-          }
+
+        // Interruptor de voz/texto para prender o apagar el Modo Invitado
+        if (/(apaga|desactiva|silencia|bloquea).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
+          cloudState.guestModeEnabled = false;
+          saveCloudState();
+          await safeSendMessage(
+            remoteJid,
+            {
+              text: "🤖 *LILA:* Modo invitado *desactivado*, Señor Carlos. A partir de este momento ignoraré a terceros y solo atenderé sus órdenes.",
+            },
+            { quoted: msg }
+          );
+          continue;
         }
+        if (/(activa|prende|enciende|habilita).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
+          cloudState.guestModeEnabled = true;
+          saveCloudState();
+          await safeSendMessage(
+            remoteJid,
+            {
+              text: `🤖 *LILA:* Modo invitado *activado*, Señor Carlos. Responderé a sus amigos cuando me llamen (máximo ${GUEST_MAX_MSGS_PER_HOUR} mensajes por hora y sin acceso a ninguna función privada).`,
+            },
+            { quoted: msg }
+          );
+          continue;
+        }
+
+        const query = rawQuery || "Hola Lila, ¿estás activa?";
+        const historyKey = remoteJid || "owner_self";
+        const sendIntermediate = async (partialText) => {
+          if (partialText && partialText.trim()) {
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
+          }
+        };
+        const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
+        if (reply && reply.trim()) {
+          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
+        }
+        continue;
+      }
+
+      // --- NIVEL 2: MODO INVITADO / AMIGOS EN GRUPOS (EJ. EIMAR) ---
+      if (!cloudState.guestModeEnabled) continue;
+
+      const senderKey = participantJid || remoteJid;
+      const rateCheck = checkGuestRateLimit(senderKey);
+      if (!rateCheck.allowed) {
+        if (rateCheck.limitJustReached) {
+          await safeSendMessage(
+            remoteJid,
+            {
+              text: `🤖 *LILA:* Hola ${pushName}, he alcanzado mi límite de ${GUEST_MAX_MSGS_PER_HOUR} respuestas por hora en modo invitado para conservar energía. Por ahora quedo atenta únicamente a mi creador, el Señor Carlos.`,
+            },
+            { quoted: msg }
+          );
+        }
+        continue;
+      }
+
+      const guestQuery = rawQuery || `Hola Lila, soy ${pushName}, preséntate brevemente.`;
+      const guestReply = await askLilaGuestAI(guestQuery, pushName, senderKey);
+      if (guestReply && guestReply.trim()) {
+        await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${guestReply.trim()}` }, { quoted: msg });
       }
     }
   });
