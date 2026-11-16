@@ -204,9 +204,12 @@ async function saveSchedules() {
   }
 }
 
-// --- PERSISTENCIA TOTAL DE LA SESIÓN DE WHATSAPP EN MONGODB ---
+// --- PERSISTENCIA TOTAL DE LA SESIÓN DE WHATSAPP EN MONGODB (ATÓMICA CON BULKWRITE) ---
 let syncAuthTimeout = null;
-function scheduleSyncAuthToMongo(delayMs = 1500) {
+let isSyncingAuth = false;
+let pendingSyncAgain = false;
+
+function scheduleSyncAuthToMongo(delayMs = 300) {
   if (syncAuthTimeout) clearTimeout(syncAuthTimeout);
   syncAuthTimeout = setTimeout(() => {
     syncAllAuthToMongo().catch(() => {});
@@ -238,6 +241,18 @@ async function restoreAuthFromMongo() {
       }
       console.log(`[LILA] 🍃 ${files.length} archivos de sesión de WhatsApp restaurados desde MongoDB.`);
     }
+
+    // Restaurar caché de mensajes enviados para responder a cualquier solicitud Signal Retry tras reinicios
+    const sentCol = mongoDb.collection("sent_messages_cache");
+    const cachedMsgs = await sentCol.find({}).sort({ updatedAt: -1 }).limit(250).toArray();
+    for (const doc of cachedMsgs) {
+      if (doc.msgId && doc.messageContent) {
+        sentMessagesCache.set(doc.msgId, doc.messageContent);
+        if (doc.remoteJid) {
+          sentMessagesCache.set(`${doc.remoteJid}:${doc.msgId}`, doc.messageContent);
+        }
+      }
+    }
   } catch (err) {
     console.error("Error restaurando sesión de WhatsApp desde MongoDB:", err.message);
   }
@@ -245,29 +260,48 @@ async function restoreAuthFromMongo() {
 
 async function syncAllAuthToMongo() {
   if (!isMongoConnected || !mongoDb || !fs.existsSync(AUTH_FOLDER)) return;
+  if (isSyncingAuth) {
+    pendingSyncAgain = true;
+    return;
+  }
+  isSyncingAuth = true;
   try {
     const files = fs.readdirSync(AUTH_FOLDER);
     if (!files.includes("creds.json")) return;
     const col = mongoDb.collection("whatsapp_auth");
     const currentFileNames = [];
+    const bulkOps = [];
+    const nowIso = new Date().toISOString();
+
     for (const file of files) {
       const fullPath = path.join(AUTH_FOLDER, file);
-      if (fs.statSync(fullPath).isFile()) {
-        currentFileNames.push(file);
-        const content = fs.readFileSync(fullPath, "utf-8");
-        await col.updateOne(
-          { fileName: file },
-          { $set: { fileName: file, content, updatedAt: new Date().toISOString() } },
-          { upsert: true }
-        );
-      }
+      try {
+        if (fs.statSync(fullPath).isFile()) {
+          currentFileNames.push(file);
+          const content = fs.readFileSync(fullPath, "utf-8");
+          bulkOps.push({
+            updateOne: {
+              filter: { fileName: file },
+              update: { $set: { fileName: file, content, updatedAt: nowIso } },
+              upsert: true,
+            },
+          });
+        }
+      } catch (_) {}
     }
-    if (currentFileNames.length > 0) {
+
+    if (bulkOps.length > 0) {
+      await col.bulkWrite(bulkOps, { ordered: false });
       await col.deleteMany({ fileName: { $nin: currentFileNames } });
     }
-    console.log(`[LILA] 🍃 Sesión de WhatsApp respaldada en MongoDB (${currentFileNames.length} archivos).`);
   } catch (err) {
     console.error("Error respaldando sesión en MongoDB:", err.message);
+  } finally {
+    isSyncingAuth = false;
+    if (pendingSyncAgain) {
+      pendingSyncAgain = false;
+      scheduleSyncAuthToMongo(250);
+    }
   }
 }
 
@@ -325,6 +359,18 @@ function rememberMessage(msgObj) {
     const firstKey = sentMessagesCache.keys().next().value;
     sentMessagesCache.delete(firstKey);
   }
+
+  // Persistir en MongoDB para que si el teléfono de mamá pide reintento Signal tras un reinicio de Render, siempre tenga el mensaje
+  if (isMongoConnected && mongoDb && msgObj?.key?.fromMe) {
+    mongoDb
+      .collection("sent_messages_cache")
+      .updateOne(
+        { msgId: id },
+        { $set: { msgId: id, remoteJid, messageContent, updatedAt: new Date().toISOString() } },
+        { upsert: true }
+      )
+      .catch(() => {});
+  }
 }
 
 // Normaliza el JID respetando grupos (@g.us) y canales
@@ -342,8 +388,18 @@ function normalizeTargetJid(jid) {
 async function safeSendMessage(jid, content, options = {}) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
   const target = normalizeTargetJid(jid);
-  const sent = await sock.sendMessage(target, content, options);
+  const { ensureFreshSession, ...sendOpts } = options || {};
+
+  // Si es un envío de rutina a un contacto individual (ej. Mamá), refrescar sesión Signal PreKey antes de cifrar
+  if (ensureFreshSession && target && target.endsWith("@s.whatsapp.net")) {
+    try {
+      await sock.assertSessions([target], true);
+    } catch (_) {}
+  }
+
+  const sent = await sock.sendMessage(target, content, sendOpts);
   if (sent) rememberMessage(sent);
+  scheduleSyncAuthToMongo(250);
   return sent;
 }
 
@@ -443,6 +499,34 @@ function getOwnerNotificationJid() {
   return `${ownerNum}@s.whatsapp.net`;
 }
 
+function isSelfOrOwnerTarget(str) {
+  const s = String(str || "").toLowerCase().trim();
+  const norm = normalizeSearchKey(s);
+  return (
+    [
+      "lila_group",
+      "notificaciones_lila",
+      "carlos",
+      "señor carlos",
+      "senor carlos",
+      "sr carlos",
+      "carlos uriana",
+      "yo",
+      "mi",
+      "mí",
+      "a mi",
+      "a mí",
+      "me",
+      "owner",
+      "creador",
+      "lila",
+      "grupo lila",
+    ].includes(s) ||
+    ["carlos", "senorcarlos", "srcarlos", "carlosuriana", "yo", "ami", "owner", "creador", "lilagroup", "grupolila"].includes(norm) ||
+    Boolean(OWNER_PHONE && s.includes(OWNER_PHONE))
+  );
+}
+
 function resolveContactTarget(target) {
   if (!target) return { ok: false, error: "No se indicó destinatario." };
   const raw = String(target).trim();
@@ -452,9 +536,9 @@ function resolveContactTarget(target) {
     .trim();
   const normTarget = normalizeSearchKey(lower);
 
-  if (lower === "lila_group" || lower === "notificaciones_lila") {
+  if (isSelfOrOwnerTarget(raw) || isSelfOrOwnerTarget(lower)) {
     const notifJid = getOwnerNotificationJid();
-    return { ok: true, jid: notifJid, canonicalName: "Grupo LILA", relationship: "owner_group" };
+    return { ok: true, jid: notifJid, canonicalName: "Señor Carlos (Grupo LILA)", relationship: "owner_group" };
   }
 
   if (lower === "hermana" || lower === "hermanas" || raw.toLowerCase() === "mi hermana") {
@@ -1008,18 +1092,23 @@ const CLOUD_TOOLS_DECLARATIONS = [
   },
   {
     name: "schedule_whatsapp_message",
-    description: "Programa un mensaje de WhatsApp a un contacto o grupo a una hora determinada.",
+    description:
+      "Programa un recordatorio para el Señor Carlos (ej. 'recuérdame ir al gym a las 3 pm') o una rutina/mensaje programado a un contacto o grupo a una hora determinada.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: { type: "STRING", description: "Contacto (Paula, Pechy, Nelly, Perla), nombre de grupo o número." },
-        message: { type: "STRING", description: "Texto o instrucción de saludo a enviar." },
-        time: { type: "STRING", description: "Hora en formato 24h HH:MM (ej. '07:00')." },
+        target: {
+          type: "STRING",
+          description:
+            "Si es un recordatorio para el Señor Carlos ('recuérdame...', 'avísame...'), pon 'Carlos' o 'lila_group'. Si es para otra persona o grupo, pon su nombre (ej. Paula, Pechy, Nelly, Perla, Cuarto gamer).",
+        },
+        message: { type: "STRING", description: "Texto del recordatorio o instrucción de saludo a enviar." },
+        time: { type: "STRING", description: "Hora en formato 24h HH:MM (ej. '07:00', '15:00', '18:30')." },
         specificDate: { type: "STRING", description: "Fecha opcional YYYY-MM-DD." },
         recurring: { type: "BOOLEAN", description: "true solo si dijo 'todos los días'; false si es una sola vez." },
-        useAI: { type: "BOOLEAN", description: "false si el mensaje fue dictado literal; true si pidió redactar un saludo." },
+        useAI: { type: "BOOLEAN", description: "false si es un recordatorio o mensaje dictado; true si pidió redactar un saludo." },
       },
-      required: ["target", "message", "time"],
+      required: ["message", "time"],
     },
   },
   {
@@ -1160,13 +1249,17 @@ async function executeCloudToolCall(name, args) {
       return `Rutinas activas programadas (${activeList.length}):\n` + lines.join("\n");
     }
     case "schedule_whatsapp_message": {
-      const resolved = await resolveContactTargetAsync(args.target);
-      if (!resolved.ok && resolved.ambiguous) return resolved.error;
-      const targetStr = resolved.ok
-        ? resolved.jid.endsWith("@g.us")
-          ? resolved.jid
-          : resolved.jid.split("@")[0]
-        : args.target;
+      const rawTarget = String(args?.target || "lila_group").trim();
+      const isSelf = !args?.target || isSelfOrOwnerTarget(rawTarget);
+      let targetStr = "lila_group";
+      let contactName = "Señor Carlos (Grupo LILA)";
+
+      if (!isSelf) {
+        const resolved = await resolveContactTargetAsync(rawTarget);
+        if (!resolved.ok) return resolved.error;
+        targetStr = resolved.jid.endsWith("@g.us") ? resolved.jid : resolved.jid.split("@")[0];
+        contactName = resolved.canonicalName || rawTarget;
+      }
 
       const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
       const cleanTime = String(args.time || "07:00").trim().padStart(5, "0");
@@ -1182,12 +1275,14 @@ async function executeCloudToolCall(name, args) {
         } else {
           specificDate = addDaysToDateStr(todayStr, 1);
         }
+      } else if (!specificDate && !isRecurring && cleanTime > currentHHMM) {
+        specificDate = todayStr;
       }
 
       const newItem = {
         id: Date.now().toString(36),
         target: targetStr,
-        contactName: resolved.canonicalName || args.target,
+        contactName,
         message: args.message,
         time: cleanTime,
         specificDate,
@@ -1205,7 +1300,7 @@ async function executeCloudToolCall(name, args) {
           : specificDate
           ? `para el ${specificDate} a las ${cleanTime}`
           : `a las ${cleanTime}`;
-      return `Rutina programada exitosamente para '${newItem.contactName}' ${startInfo} (${
+      return `Recordatorio/Rutina programada exitosamente para '${newItem.contactName}' ${startInfo} (${
         newItem.recurring ? "todos los días" : "una sola vez"
       }).`;
     }
@@ -1398,6 +1493,32 @@ async function callGeminiWithFallback(
           continue;
         }
 
+        // Guardia anti-alucinación: si la IA promete recordar/avisar a una hora específica sin haber llamado a schedule_whatsapp_message ni add_agenda_event
+        const claimedReminderSet =
+          /(le recordar[eé]|te recordar[eé]|le avisar[eé]|queda programad[oa]|he programado|recordatorio.*programado|rutina.*programada)/i.test(
+            stepText
+          ) && /\b\d{1,2}(:\d{2})?\s*(a\.?\s*m\.?|p\.?\s*m\.?|de la|hrs|horas)?\b/i.test(`${userPromptText} ${stepText}`);
+        if (
+          enableTools &&
+          claimedReminderSet &&
+          !calledTools.has("schedule_whatsapp_message") &&
+          !calledTools.has("add_agenda_event")
+        ) {
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts: [{ text: stepText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `[SISTEMA: Prometiste un recordatorio o rutina pero aún NO has ejecutado la herramienta 'schedule_whatsapp_message'. Invoca 'schedule_whatsapp_message' AHORA MISMO (con target='lila_group' si el recordatorio es para el Señor Carlos, y time en formato 24h 'HH:MM') para que quede guardado realmente en la base de datos.]`,
+                },
+              ],
+            },
+          ];
+          continue;
+        }
+
         if (stepText) return { ok: true, text: stepText };
         if (lastToolResultsSummary) return { ok: true, text: lastToolResultsSummary };
         break;
@@ -1430,7 +1551,7 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
     "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google. Tu creador es el Señor Carlos.\n" +
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
     "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
-    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos dice que tiene algo para cierto día (ej. 'para el viernes tengo exposición y laboratorio'), agenda DE INMEDIATO con `add_agenda_event` calculando la fecha exacta. Si pregunta qué tiene pendiente ('¿qué tengo pendiente?'), invoca `get_pending_tasks`. Si pregunta qué rutinas tiene programadas, invoca `get_scheduled_routines`.\n" +
+    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos pide que le recuerdes algo hoy o a cierta hora (ej. 'recuérdame ir al gym a las 3 pm'), invoca SIEMPRE `schedule_whatsapp_message` con `target: 'lila_group'`, `time` en formato 24h ('15:00') y `recurring: false`. Si dice que tiene una entrega o examen para cierto día, agenda con `add_agenda_event`. NUNCA digas que vas a recordarle algo sin haber invocado `schedule_whatsapp_message` o `add_agenda_event`.\n" +
     "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira. NUNCA digas que enviaste o respondiste un correo sin haber invocado `send_or_reply_gmail`.\n" +
     "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en un grupo de WhatsApp (ej. 'Cuarto gamer'), invoca DE INMEDIATO `send_whatsapp_message` con el nombre del grupo en `target`.\n" +
     "7. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
@@ -1766,48 +1887,60 @@ function isTimeWithinMinutesWindow(targetHHMM, currentHHMM, maxWindowMinutes = 3
 }
 
 // --- EVALUADOR DE RUTINAS Y RECORDATORIOS ESCALONADOS (Evita horas pasadas) ---
+let isEvaluatingSchedules = false;
 async function evaluateSchedules() {
-  if (connectionStatus !== "connected" || !sock) return;
-  const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
+  if (connectionStatus !== "connected" || !sock || isEvaluatingSchedules) return;
+  isEvaluatingSchedules = true;
+  try {
+    const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
 
-  let changed = false;
-  for (const item of schedules) {
-    if (!item.active) continue;
+    let changed = false;
+    for (const item of schedules) {
+      if (!item.active) continue;
 
-    if (item.pauseUntil && todayStr < item.pauseUntil) continue;
-    if (item.pauseUntil && todayStr >= item.pauseUntil) {
-      item.pauseUntil = null;
-      changed = true;
-    }
-
-    if (item.specificDate && item.specificDate !== todayStr) continue;
-
-    // Solo dispara si estamos dentro de la ventana de 30 minutos de la hora programada (nunca horas después en la noche)
-    if (isTimeWithinMinutesWindow(item.time, currentHHMM, 30) && item.lastSentDate !== todayStr) {
-      const isOwnerNotification =
-        Boolean(item.parentEventId) ||
-        item.target === "lila_group" ||
-        (OWNER_PHONE && String(item.target).includes(OWNER_PHONE));
-      const jid = isOwnerNotification ? getOwnerNotificationJid() : toWhatsAppJid(item.target);
-      if (!jid) continue;
-
-      let finalMessage = item.message;
-      if (item.useAI) {
-        finalMessage = await generateSafeRoutineMessage(item.target, item.message);
-      }
-
-      try {
-        await safeSendMessage(jid, { text: finalMessage });
-        item.lastSentDate = todayStr;
-        if (!item.recurring) item.active = false;
+      if (item.pauseUntil && todayStr < item.pauseUntil) continue;
+      if (item.pauseUntil && todayStr >= item.pauseUntil) {
+        item.pauseUntil = null;
         changed = true;
-        console.log(`[LILA] ✅ Recordatorio/Rutina enviada a ${jid}: ${finalMessage}`);
-      } catch (e) {
-        console.error("Error ejecutando rutina:", e.message);
+      }
+
+      if (item.specificDate && item.specificDate !== todayStr) continue;
+
+      // Para recordatorios únicos (!item.recurring) damos 180 min de margen por si Render reinició; para rutinas diarias, 45 min
+      const windowMins = item.recurring ? 45 : 180;
+      if (isTimeWithinMinutesWindow(item.time, currentHHMM, windowMins) && item.lastSentDate !== todayStr) {
+        const isOwnerNotification =
+          Boolean(item.parentEventId) ||
+          isSelfOrOwnerTarget(item.target) ||
+          isSelfOrOwnerTarget(item.contactName);
+        let jid = isOwnerNotification ? getOwnerNotificationJid() : toWhatsAppJid(item.target);
+        if (!jid && (!item.recurring || /señor carlos/i.test(String(item.message || "")))) {
+          jid = getOwnerNotificationJid();
+        }
+        if (!jid) continue;
+
+        let finalMessage = item.message;
+        if (item.useAI && !isOwnerNotification) {
+          finalMessage = await generateSafeRoutineMessage(item.target, item.message);
+        } else if (isOwnerNotification && !/^[📅⚠️🔔⏰🤖]/.test(String(finalMessage).trim())) {
+          finalMessage = `⏰ *Recordatorio LILA:* ${finalMessage}`;
+        }
+
+        try {
+          await safeSendMessage(jid, { text: finalMessage }, { ensureFreshSession: !isOwnerNotification });
+          item.lastSentDate = todayStr;
+          if (!item.recurring) item.active = false;
+          changed = true;
+          console.log(`[LILA] ✅ Recordatorio/Rutina enviada a ${jid}: ${finalMessage}`);
+        } catch (e) {
+          console.error("Error ejecutando rutina:", e.message);
+        }
       }
     }
+    if (changed) saveSchedules();
+  } finally {
+    isEvaluatingSchedules = false;
   }
-  if (changed) saveSchedules();
 }
 
 // Vigía proactivo de Gmail en la nube (Envía notificaciones al grupo LILA)
