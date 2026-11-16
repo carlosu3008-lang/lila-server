@@ -385,15 +385,23 @@ function normalizeTargetJid(jid) {
   return raw;
 }
 
+const refreshedContactsThisBoot = new Set();
+
 async function safeSendMessage(jid, content, options = {}) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
   const target = normalizeTargetJid(jid);
   const { ensureFreshSession, ...sendOpts } = options || {};
 
-  // Si es un envío de rutina a un contacto individual (ej. Mamá), refrescar sesión Signal PreKey antes de cifrar
-  if (ensureFreshSession && target && target.endsWith("@s.whatsapp.net")) {
+  // Para cualquier contacto externo (ej. Mamá), asegurar sesión Signal PreKey fresca tras cada inicio o en rutinas
+  const isExternalContact =
+    target &&
+    target.endsWith("@s.whatsapp.net") &&
+    (!OWNER_PHONE || !target.includes(OWNER_PHONE));
+
+  if (isExternalContact && (ensureFreshSession || !refreshedContactsThisBoot.has(target))) {
     try {
       await sock.assertSessions([target], true);
+      refreshedContactsThisBoot.add(target);
     } catch (_) {}
   }
 
