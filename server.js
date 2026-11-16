@@ -5,6 +5,7 @@ const {
   makeCacheableSignalKeyStore,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  generateMessageIDV2,
 } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const pino = require("pino");
@@ -19,6 +20,9 @@ const LILA_SECRET_KEY = (process.env.LILA_SECRET_KEY || "lila_secret_2026").trim
 let GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 let GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
 const OWNER_PHONE = (process.env.OWNER_PHONE || "573018276980").replace(/\D/g, "");
+const MOM_LID_JID = "195705033511068@lid";
+const MOM_PHONE_DIGITS = "573046497549";
+const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 
 const silentLogger = pino({ level: "silent" });
 
@@ -82,10 +86,10 @@ if (process.env.SESSION_DATA) {
 
 let cloudState = {
   learnedContacts: {
-    paula: "573046497549@s.whatsapp.net",
-    pechy: "573046497549@s.whatsapp.net",
-    "mamá": "573046497549@s.whatsapp.net",
-    mama: "573046497549@s.whatsapp.net",
+    paula: MOM_LID_JID,
+    pechy: MOM_LID_JID,
+    "mamá": MOM_LID_JID,
+    mama: MOM_LID_JID,
   },
   agendaTasks: [],
   currentLocation: {
@@ -104,6 +108,7 @@ let cloudState = {
   recentFetchedEmails: [],
   lilaNotificationGroupJid: null,
   guestModeEnabled: true,
+  telegramChatId: null,
 };
 
 try {
@@ -130,7 +135,14 @@ async function loadStateFromMongo() {
     if (doc) {
       cloudState = {
         ...cloudState,
-        learnedContacts: { ...cloudState.learnedContacts, ...(doc.learnedContacts || {}) },
+        learnedContacts: {
+          ...cloudState.learnedContacts,
+          ...(doc.learnedContacts || {}),
+          paula: MOM_LID_JID,
+          pechy: MOM_LID_JID,
+          "mamá": MOM_LID_JID,
+          mama: MOM_LID_JID,
+        },
         currentLocation: { ...cloudState.currentLocation, ...(doc.currentLocation || {}) },
         gmailOAuth: { ...cloudState.gmailOAuth, ...(doc.gmailOAuth || {}) },
         agendaTasks: Array.isArray(doc.agendaTasks) ? doc.agendaTasks : cloudState.agendaTasks,
@@ -139,6 +151,7 @@ async function loadStateFromMongo() {
         recentFetchedEmails: Array.isArray(doc.recentFetchedEmails) ? doc.recentFetchedEmails : cloudState.recentFetchedEmails,
         lilaNotificationGroupJid: doc.lilaNotificationGroupJid || cloudState.lilaNotificationGroupJid,
         guestModeEnabled: typeof doc.guestModeEnabled === "boolean" ? doc.guestModeEnabled : cloudState.guestModeEnabled,
+        telegramChatId: doc.telegramChatId || cloudState.telegramChatId,
       };
       console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
     }
@@ -373,39 +386,44 @@ function rememberMessage(msgObj) {
   }
 }
 
-// Normaliza el JID respetando grupos (@g.us) y canales
+// Normaliza el JID respetando grupos (@g.us), identidades vinculadas (@lid) y el canal LID oficial de Mamá
 function normalizeTargetJid(jid) {
   if (!jid) return null;
   const raw = String(jid).trim();
-  if (raw.endsWith("@g.us")) return raw;
+  if (raw.includes(MOM_PHONE_DIGITS) || raw.includes("195705033511068")) {
+    return MOM_LID_JID;
+  }
+  if (raw.endsWith("@g.us") || raw.endsWith("@lid")) return raw;
   const ownerNum = OWNER_PHONE || connectedNumber;
-  if (ownerNum && (raw.includes(ownerNum) || raw.endsWith("@lid"))) {
+  if (ownerNum && raw.includes(ownerNum)) {
     return `${ownerNum}@s.whatsapp.net`;
+  }
+  if (/^\d{10,15}$/.test(raw)) {
+    return `${raw}@s.whatsapp.net`;
   }
   return raw;
 }
-
-const refreshedContactsThisBoot = new Set();
 
 async function safeSendMessage(jid, content, options = {}) {
   if (!sock) throw new Error("Socket de WhatsApp no inicializado");
   const target = normalizeTargetJid(jid);
   const { ensureFreshSession, ...sendOpts } = options || {};
 
-  // Para cualquier contacto externo (ej. Mamá), asegurar sesión Signal PreKey fresca tras cada inicio o en rutinas
-  const isExternalContact =
-    target &&
-    target.endsWith("@s.whatsapp.net") &&
-    (!OWNER_PHONE || !target.includes(OWNER_PHONE));
-
-  if (isExternalContact && (ensureFreshSession || !refreshedContactsThisBoot.has(target))) {
-    try {
-      await sock.assertSessions([target], true);
-      refreshedContactsThisBoot.add(target);
-    } catch (_) {}
+  // Pre-generar y pre-guardar el mensaje en sentMessagesCache ANTES de enviarlo por red (elimina la condición de carrera de 8ms en reintentos Signal)
+  const msgId = sendOpts.messageId || (typeof generateMessageIDV2 === "function" ? generateMessageIDV2(sock.user?.id) : undefined);
+  if (msgId && content?.text) {
+    const preProto = {
+      extendedTextMessage: { text: String(content.text) },
+      conversation: String(content.text),
+    };
+    sentMessagesCache.set(msgId, preProto);
+    if (target) {
+      sentMessagesCache.set(`${target}:${msgId}`, preProto);
+    }
   }
 
-  const sent = await sock.sendMessage(target, content, sendOpts);
+  const finalOptions = msgId ? { ...sendOpts, messageId: msgId } : sendOpts;
+  const sent = await sock.sendMessage(target, content, finalOptions);
   if (sent) rememberMessage(sent);
   scheduleSyncAuthToMongo(250);
   return sent;
@@ -557,13 +575,13 @@ function resolveContactTarget(target) {
     };
   }
 
-  if (["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower) || ["mama", "mami", "madre", "paula", "pechy"].includes(normTarget)) {
-    const momJid =
-      cloudState.learnedContacts["paula"] ||
-      cloudState.learnedContacts["pechy"] ||
-      cloudState.learnedContacts["mamá"] ||
-      "573046497549@s.whatsapp.net";
-    return { ok: true, jid: momJid, canonicalName: "Paula (Pechy)", relationship: "mother" };
+  if (
+    ["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower) ||
+    ["mama", "mami", "madre", "paula", "pechy"].includes(normTarget) ||
+    raw.includes(MOM_PHONE_DIGITS) ||
+    raw.includes("195705033511068")
+  ) {
+    return { ok: true, jid: MOM_LID_JID, canonicalName: "Paula (Pechy)", relationship: "mother" };
   }
 
   if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us") || raw.includes("@lid")) {
@@ -1150,7 +1168,115 @@ const CLOUD_TOOLS_DECLARATIONS = [
       properties: {},
     },
   },
+  {
+    name: "diagnose_and_repair_system",
+    description:
+      "Ejecuta un autodiagnóstico profundo en vivo de MongoDB Atlas, llaves de cifrado Signal de WhatsApp, rutinas y correos. Si applyFix es true, aplica automáticamente las reparaciones detectadas.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        applyFix: {
+          type: "BOOLEAN",
+          description: "false si solo se solicita diagnosticar y proponer mejoras; true si el Señor Carlos confirmó aplicar la reparación.",
+        },
+      },
+    },
+  },
 ];
+
+async function runSelfDiagnosticAndRepair(applyFix = false) {
+  const issues = [];
+  const fixesApplied = [];
+
+  // 1. Revisar sesiones Signal y canal LID de Mamá
+  if (
+    cloudState.learnedContacts["paula"] !== MOM_LID_JID ||
+    cloudState.learnedContacts["pechy"] !== MOM_LID_JID ||
+    cloudState.learnedContacts["mamá"] !== MOM_LID_JID
+  ) {
+    issues.push(
+      `El contacto de Mamá (Paula/Pechy) apuntaba al formato antiguo (@s.whatsapp.net) en vez de su canal cifrado activo LID (${MOM_LID_JID}).`
+    );
+    if (applyFix) {
+      cloudState.learnedContacts["paula"] = MOM_LID_JID;
+      cloudState.learnedContacts["pechy"] = MOM_LID_JID;
+      cloudState.learnedContacts["mamá"] = MOM_LID_JID;
+      cloudState.learnedContacts["mama"] = MOM_LID_JID;
+      await saveCloudState();
+      fixesApplied.push(`Canal de Mamá migrado a su sesión Signal LID verificada (${MOM_LID_JID}).`);
+    }
+  }
+
+  // 2. Revisar rutinas con target antiguo o inválido
+  for (const s of schedules) {
+    if (!s.active) continue;
+    if (String(s.target).includes(MOM_PHONE_DIGITS) && s.target !== MOM_LID_JID) {
+      issues.push(`La rutina '${s.contactName}' (${s.time}) usaba el identificador antiguo '${s.target}' en vez de '${MOM_LID_JID}'.`);
+      if (applyFix) {
+        s.target = MOM_LID_JID;
+        fixesApplied.push(`Rutina '${s.contactName}' (${s.time}) actualizada al canal LID '${MOM_LID_JID}'.`);
+      }
+    } else if (!toWhatsAppJid(s.target) && !isSelfOrOwnerTarget(s.target)) {
+      issues.push(`La rutina '${s.message}' (${s.time}) tiene un destinatario no resuelto ('${s.target}').`);
+      if (applyFix) {
+        s.target = "lila_group";
+        fixesApplied.push(`Rutina '${s.message}' redirigida al grupo oficial LILA.`);
+      }
+    }
+  }
+  if (applyFix && fixesApplied.length > 0) {
+    await saveSchedules();
+  }
+
+  // 3. Revisar archivos de sesión Signal estancados en disco/MongoDB
+  try {
+    if (fs.existsSync(AUTH_FOLDER)) {
+      const staleFiles = fs.readdirSync(AUTH_FOLDER).filter((f) => f.startsWith(`session-${MOM_PHONE_DIGITS}.`));
+      if (staleFiles.length > 0) {
+        issues.push(
+          `Se detectaron ${staleFiles.length} archivos de sesión Signal antiguos (${staleFiles.join(", ")}) con PreKey pendiente que causaban el aviso 'Esperando mensaje'.`
+        );
+        if (applyFix) {
+          for (const sf of staleFiles) {
+            try {
+              fs.unlinkSync(path.join(AUTH_FOLDER, sf));
+            } catch (_) {}
+          }
+          if (isMongoConnected && mongoDb) {
+            await mongoDb.collection("whatsapp_auth").deleteMany({
+              fileName: { $regex: /^session-573046497549\./ },
+            });
+          }
+          fixesApplied.push(`Eliminados ${staleFiles.length} archivos de sesión Signal obsoletos en disco y MongoDB Atlas.`);
+        }
+      }
+    }
+  } catch (_) {}
+
+  const statusHeader =
+    `📊 *Autodiagnóstico de LILA Cloud:*\n` +
+    `- MongoDB Atlas: ${isMongoConnected ? "Conectado ✅" : "Desconectado ⚠️"}\n` +
+    `- WhatsApp Signal: ${connectionStatus} (+${connectedNumber})\n` +
+    `- Gmail OAuth: Personal (${cloudState.gmailOAuth?.Personal ? "✅" : "⚠️"}) | Uniguajira (${cloudState.gmailOAuth?.Uniguajira ? "✅" : "⚠️"})\n` +
+    `- Rutinas activas: ${schedules.filter((s) => s.active).length}`;
+
+  if (issues.length === 0) {
+    return `${statusHeader}\n\nTodo el sistema de cifrado Signal (canal LID), base de datos MongoDB y rutinas se encuentra en perfecto estado sin anomalías.`;
+  }
+
+  if (!applyFix) {
+    return (
+      `${statusHeader}\n\n⚠️ *Problemas detectados (${issues.length}):*\n` +
+      issues.map((i, idx) => `${idx + 1}. ${i}`).join("\n") +
+      `\n\n💡 *Mejora lista:* Puedo corregir estos puntos en caliente ahora mismo. ¿Me confirma para aplicarlo de una vez, Señor Carlos?`
+    );
+  }
+
+  return (
+    `${statusHeader}\n\n✅ *Reparación automática completada (${fixesApplied.length} acciones):*\n` +
+    fixesApplied.map((f, idx) => `${idx + 1}. ${f}`).join("\n")
+  );
+}
 
 function findMatchingEmailContext(targetHint = "") {
   const list = Array.isArray(cloudState.recentFetchedEmails) ? cloudState.recentFetchedEmails : [];
@@ -1169,6 +1295,8 @@ function findMatchingEmailContext(targetHint = "") {
 
 async function executeCloudToolCall(name, args) {
   switch (name) {
+    case "diagnose_and_repair_system":
+      return await runSelfDiagnosticAndRepair(Boolean(args?.applyFix));
     case "get_finances_summary": {
       if (!isMongoConnected || !mongoDb) return "Base de datos de finanzas en MongoDB no disponible en este momento.";
       try {
@@ -1265,7 +1393,7 @@ async function executeCloudToolCall(name, args) {
       if (!isSelf) {
         const resolved = await resolveContactTargetAsync(rawTarget);
         if (!resolved.ok) return resolved.error;
-        targetStr = resolved.jid.endsWith("@g.us") ? resolved.jid : resolved.jid.split("@")[0];
+        targetStr = resolved.jid;
         contactName = resolved.canonicalName || rawTarget;
       }
 
@@ -2122,7 +2250,7 @@ app.post("/schedule", requireAuth, async (req, res) => {
 
   const newItem = {
     id: Date.now().toString(36),
-    target: resolved.ok ? (resolved.jid.endsWith("@g.us") ? resolved.jid : resolved.jid.split("@")[0]) : target,
+    target: resolved.ok ? resolved.jid : target,
     contactName: resolved.canonicalName || target,
     message,
     time: cleanTime,
@@ -2235,6 +2363,58 @@ app.get("/reset-session", requireAuth, async (req, res) => {
   }
 });
 
+// --- BOT DE TELEGRAM 24/7 (SIN CIFRADO SIGNAL NI QR) ---
+let telegramOffset = 0;
+async function sendTelegramMessage(chatId, text) {
+  if (!TELEGRAM_BOT_TOKEN || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+  } catch (err) {
+    console.error("[LILA Telegram] Error enviando mensaje:", err.message);
+  }
+}
+
+async function pollTelegramUpdates() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${telegramOffset}&timeout=20`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      for (const update of data.result || []) {
+        telegramOffset = update.update_id + 1;
+        const msg = update.message;
+        if (!msg?.text) continue;
+        const chatId = msg.chat.id;
+        if (cloudState.telegramChatId !== chatId) {
+          cloudState.telegramChatId = chatId;
+          saveCloudState();
+        }
+        const rawText = msg.text.replace(/^\/start\s*/i, "").replace(/^lila[,:\s]*/i, "").trim() || "Hola Lila";
+        const sendInterm = async (partial) => {
+          if (partial && partial.trim()) await sendTelegramMessage(chatId, `🤖 LILA: ${partial.trim()}`);
+        };
+        const reply = await askLilaCloudAI(rawText, `tg_${chatId}`, true, sendInterm);
+        if (reply && reply.trim()) {
+          await sendTelegramMessage(chatId, `🤖 LILA: ${reply.trim()}`);
+        }
+      }
+    }
+  } catch (_) {}
+  setTimeout(pollTelegramUpdates, 2000);
+}
+
+function startTelegramBot() {
+  if (!TELEGRAM_BOT_TOKEN) return;
+  console.log("[LILA] ✈️ Bot de Telegram 24/7 activo.");
+  pollTelegramUpdates();
+}
+
 app.listen(PORT, async () => {
   console.log(`[LILA] 🚀 Servidor activo en puerto ${PORT}`);
   if (MongoClient) {
@@ -2242,9 +2422,11 @@ app.listen(PORT, async () => {
       await initMongo();
       await loadStateFromMongo();
       await restoreAuthFromMongo();
+      await runSelfDiagnosticAndRepair(true);
     } catch (e) {
       console.error("[LILA] Error en inicialización de MongoDB:", e.message);
     }
   }
   startWhatsApp().catch((err) => console.error("Error iniciando WhatsApp:", err));
+  startTelegramBot();
 });
