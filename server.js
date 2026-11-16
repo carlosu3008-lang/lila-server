@@ -22,7 +22,9 @@ let GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
 const OWNER_PHONE = (process.env.OWNER_PHONE || "573018276980").replace(/\D/g, "");
 const MOM_LID_JID = "195705033511068@lid";
 const MOM_PHONE_DIGITS = "573046497549";
-const TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const TELEGRAM_BOT_TOKEN = (
+  process.env.TELEGRAM_BOT_TOKEN || "9261509273:AAHlGEaqrEvqkqbLalPzTZ8ScfryeGhVBec"
+).trim();
 
 const silentLogger = pino({ level: "silent" });
 
@@ -2064,6 +2066,9 @@ async function evaluateSchedules() {
 
         try {
           await safeSendMessage(jid, { text: finalMessage }, { ensureFreshSession: !isOwnerNotification });
+          if (isOwnerNotification && cloudState.telegramChatId) {
+            await sendTelegramMessage(cloudState.telegramChatId, finalMessage);
+          }
           item.lastSentDate = todayStr;
           if (!item.recurring) item.active = false;
           changed = true;
@@ -2079,7 +2084,7 @@ async function evaluateSchedules() {
   }
 }
 
-// Vigía proactivo de Gmail en la nube (Envía notificaciones al grupo LILA)
+// Vigía proactivo de Gmail en la nube (Envía notificaciones al grupo LILA y a Telegram)
 async function pollGmailProactively() {
   if (connectionStatus !== "connected" || !sock) return;
   if (!cloudState.lilaNotificationGroupJid) {
@@ -2118,9 +2123,11 @@ async function pollGmailProactively() {
               "routine",
               false
             );
-            await safeSendMessage(notifyJid, {
-              text: `📧 *Nuevo Correo (${accName})*\n*De:* ${email.from}\n*Asunto:* ${email.subject}\n\n🤖 *LILA:* ${summary}`,
-            });
+            const alertText = `📧 *Nuevo Correo (${accName})*\n*De:* ${email.from}\n*Asunto:* ${email.subject}\n\n🤖 *LILA:* ${summary}`;
+            await safeSendMessage(notifyJid, { text: alertText });
+            if (cloudState.telegramChatId) {
+              await sendTelegramMessage(cloudState.telegramChatId, alertText);
+            }
           }
         }
       }
@@ -2140,12 +2147,14 @@ setInterval(() => {
 // --- RUTAS HTTP ---
 
 app.get("/ping", async (req, res) => {
-  await evaluateSchedules();
+  evaluateSchedules().catch(() => {});
   res.json({
     ok: true,
     service: "LILA Cloud",
     whatsapp: connectionStatus,
     connectedNumber,
+    telegramBot: "@LilaCarlos2026_bot",
+    telegramLinked: Boolean(cloudState.telegramChatId),
     mongoConnected: isMongoConnected,
     gmailSynced: {
       Personal: Boolean(cloudState.gmailOAuth?.Personal),
