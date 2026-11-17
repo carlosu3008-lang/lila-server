@@ -19,12 +19,10 @@ const PORT = process.env.PORT || 3001;
 const LILA_SECRET_KEY = (process.env.LILA_SECRET_KEY || "lila_secret_2026").trim();
 let GEMINI_API_KEY = (process.env.GEMINI_API_KEY || "").trim();
 let GROQ_API_KEY = (process.env.GROQ_API_KEY || "").trim();
-const OWNER_PHONE = (process.env.OWNER_PHONE || "573018276980").replace(/\D/g, "");
-const MOM_LID_JID = "195705033511068@lid";
-const MOM_PHONE_DIGITS = "573046497549";
-const TELEGRAM_BOT_TOKEN = (
-  process.env.TELEGRAM_BOT_TOKEN || "9261509273:AAHlGEaqrEvqkqbLalPzTZ8ScfryeGhVBec"
-).trim();
+let OWNER_PHONE = (process.env.OWNER_PHONE || "").replace(/\D/g, "");
+let MOM_LID_JID = process.env.MOM_LID_JID || "";
+let MOM_PHONE_DIGITS = process.env.MOM_PHONE_DIGITS || "";
+let TELEGRAM_BOT_TOKEN = (process.env.TELEGRAM_BOT_TOKEN || "").trim();
 
 const silentLogger = pino({ level: "silent" });
 
@@ -36,10 +34,7 @@ try {
   MongoClient = null;
 }
 
-const MONGODB_URI = (
-  process.env.MONGODB_URI ||
-  "mongodb+srv://carlosuriana2007_db_user:IrEv3ZutCpBNVTR7@cluster0.zna8fzy.mongodb.net/lila?retryWrites=true&w=majority"
-).trim();
+const MONGODB_URI = (process.env.MONGODB_URI || "").trim();
 
 let mongoClient = null;
 let mongoDb = null;
@@ -135,15 +130,24 @@ async function loadStateFromMongo() {
     const col = mongoDb.collection("cloud_state");
     const doc = await col.findOne({ _id: "main_state" });
     if (doc) {
+      if (!OWNER_PHONE && doc.ownerPhone) OWNER_PHONE = String(doc.ownerPhone).replace(/\D/g, "");
+      if (!MOM_LID_JID && doc.momLidJid) MOM_LID_JID = String(doc.momLidJid);
+      if (!MOM_PHONE_DIGITS && doc.momPhoneDigits) MOM_PHONE_DIGITS = String(doc.momPhoneDigits);
+      if (!TELEGRAM_BOT_TOKEN && doc.telegramBotToken) TELEGRAM_BOT_TOKEN = String(doc.telegramBotToken).trim();
+
       cloudState = {
         ...cloudState,
         learnedContacts: {
           ...cloudState.learnedContacts,
           ...(doc.learnedContacts || {}),
-          paula: MOM_LID_JID,
-          pechy: MOM_LID_JID,
-          "mamá": MOM_LID_JID,
-          mama: MOM_LID_JID,
+          ...(MOM_LID_JID
+            ? {
+                paula: MOM_LID_JID,
+                pechy: MOM_LID_JID,
+                "mamá": MOM_LID_JID,
+                mama: MOM_LID_JID,
+              }
+            : {}),
         },
         currentLocation: { ...cloudState.currentLocation, ...(doc.currentLocation || {}) },
         gmailOAuth: { ...cloudState.gmailOAuth, ...(doc.gmailOAuth || {}) },
@@ -154,6 +158,10 @@ async function loadStateFromMongo() {
         lilaNotificationGroupJid: doc.lilaNotificationGroupJid || cloudState.lilaNotificationGroupJid,
         guestModeEnabled: typeof doc.guestModeEnabled === "boolean" ? doc.guestModeEnabled : cloudState.guestModeEnabled,
         telegramChatId: doc.telegramChatId || cloudState.telegramChatId,
+        ownerPhone: doc.ownerPhone || OWNER_PHONE,
+        momLidJid: doc.momLidJid || MOM_LID_JID,
+        momPhoneDigits: doc.momPhoneDigits || MOM_PHONE_DIGITS,
+        telegramBotToken: doc.telegramBotToken || TELEGRAM_BOT_TOKEN,
       };
       console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
     }
@@ -392,7 +400,11 @@ function rememberMessage(msgObj) {
 function normalizeTargetJid(jid) {
   if (!jid) return null;
   const raw = String(jid).trim();
-  if (raw.includes(MOM_PHONE_DIGITS) || raw.includes("195705033511068")) {
+  const momLidPrefix = MOM_LID_JID ? MOM_LID_JID.split("@")[0] : "";
+  if (
+    (MOM_PHONE_DIGITS && raw.includes(MOM_PHONE_DIGITS)) ||
+    (momLidPrefix && raw.includes(momLidPrefix))
+  ) {
     return MOM_LID_JID;
   }
   if (raw.endsWith("@g.us") || raw.endsWith("@lid")) return raw;
@@ -523,8 +535,8 @@ function getOwnerNotificationJid() {
   if (cloudState.learnedContacts["lila"] && cloudState.learnedContacts["lila"].endsWith("@g.us")) {
     return cloudState.learnedContacts["lila"];
   }
-  const ownerNum = OWNER_PHONE || connectedNumber || "573018276980";
-  return `${ownerNum}@s.whatsapp.net`;
+  const ownerNum = OWNER_PHONE || connectedNumber;
+  return ownerNum ? `${ownerNum}@s.whatsapp.net` : null;
 }
 
 function isSelfOrOwnerTarget(str) {
@@ -577,13 +589,19 @@ function resolveContactTarget(target) {
     };
   }
 
+  const momLidPrefix = MOM_LID_JID ? MOM_LID_JID.split("@")[0] : "";
   if (
     ["mamá", "mama", "mami", "madre", "paula", "pechy"].includes(lower) ||
     ["mama", "mami", "madre", "paula", "pechy"].includes(normTarget) ||
-    raw.includes(MOM_PHONE_DIGITS) ||
-    raw.includes("195705033511068")
+    Boolean(MOM_PHONE_DIGITS && raw.includes(MOM_PHONE_DIGITS)) ||
+    Boolean(momLidPrefix && raw.includes(momLidPrefix))
   ) {
-    return { ok: true, jid: MOM_LID_JID, canonicalName: "Paula (Pechy)", relationship: "mother" };
+    const momTarget =
+      MOM_LID_JID ||
+      cloudState.learnedContacts["paula"] ||
+      cloudState.learnedContacts["pechy"] ||
+      cloudState.learnedContacts["mamá"];
+    return { ok: true, jid: momTarget, canonicalName: "Paula (Pechy)", relationship: "mother" };
   }
 
   if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us") || raw.includes("@lid")) {
@@ -1244,9 +1262,9 @@ async function runSelfDiagnosticAndRepair(applyFix = false) {
               fs.unlinkSync(path.join(AUTH_FOLDER, sf));
             } catch (_) {}
           }
-          if (isMongoConnected && mongoDb) {
+          if (isMongoConnected && mongoDb && MOM_PHONE_DIGITS) {
             await mongoDb.collection("whatsapp_auth").deleteMany({
-              fileName: { $regex: /^session-573046497549\./ },
+              fileName: { $regex: new RegExp(`^session-${MOM_PHONE_DIGITS}\\.`) },
             });
           }
           fixesApplied.push(`Eliminados ${staleFiles.length} archivos de sesión Signal obsoletos en disco y MongoDB Atlas.`);
@@ -1786,7 +1804,10 @@ async function askLilaGuestAI(guestQuery, guestName = "Invitado", jid = "guest")
 // --- GENERADOR CON ESTILO PERSONAL PARA RUTINAS HACIA CONTACTOS ---
 async function generateSafeRoutineMessage(target, instruction) {
   const targetLower = String(target || "").toLowerCase();
-  const isMom = targetLower.includes("3046497549") || ["mamá", "mama", "paula", "pechy", "madre"].some((k) => targetLower.includes(k));
+  const isMom =
+    (MOM_PHONE_DIGITS && targetLower.includes(MOM_PHONE_DIGITS)) ||
+    (MOM_LID_JID && targetLower.includes(MOM_LID_JID.split("@")[0])) ||
+    ["mamá", "mama", "paula", "pechy", "madre"].some((k) => targetLower.includes(k));
   const FALLBACK_GREETING = isMom ? "Hola Pechy, buenos días, ¿cómo amaneciste?" : "Hola, buenos días, ¿cómo amaneciste?";
 
   const styleRules = isMom
@@ -2150,10 +2171,16 @@ app.get("/ping", async (req, res) => {
   evaluateSchedules().catch(() => {});
   res.json({
     ok: true,
+    status: "online",
+  });
+});
+
+app.get("/status", requireAuth, async (req, res) => {
+  res.json({
+    ok: true,
     service: "LILA Cloud",
     whatsapp: connectionStatus,
     connectedNumber,
-    telegramBot: "@LilaCarlos2026_bot",
     telegramLinked: Boolean(cloudState.telegramChatId),
     mongoConnected: isMongoConnected,
     gmailSynced: {
