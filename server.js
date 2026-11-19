@@ -101,12 +101,41 @@ let cloudState = {
     Uniguajira: null,
   },
   notifiedEmailIds: [],
+  processedCommandIds: [],
   lastEmailContext: null,
   recentFetchedEmails: [],
   lilaNotificationGroupJid: null,
   guestModeEnabled: true,
   telegramChatId: null,
 };
+
+const processedCommandIdsSet = new Set();
+
+function hasProcessedCommand(msgId) {
+  if (!msgId) return false;
+  return processedCommandIdsSet.has(msgId) || (Array.isArray(cloudState.processedCommandIds) && cloudState.processedCommandIds.includes(msgId));
+}
+
+function markCommandProcessed(msgId) {
+  if (!msgId) return;
+  processedCommandIdsSet.add(msgId);
+  if (!Array.isArray(cloudState.processedCommandIds)) cloudState.processedCommandIds = [];
+  if (!cloudState.processedCommandIds.includes(msgId)) {
+    cloudState.processedCommandIds.push(msgId);
+    if (cloudState.processedCommandIds.length > 400) {
+      cloudState.processedCommandIds.splice(0, cloudState.processedCommandIds.length - 400);
+    }
+    saveCloudState();
+  }
+}
+
+// Escudo global anti-caídas (evita que desconexiones transitorias de red cierren Node con status 1 en Render)
+process.on("unhandledRejection", (reason) => {
+  console.error("[LILA Shield] Promesa rechazada capturada sin caída:", reason?.message || reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[LILA Shield] Excepción capturada sin caída:", err?.message || err);
+});
 
 try {
   if (fs.existsSync(STATE_FILE)) {
@@ -118,6 +147,9 @@ try {
       currentLocation: { ...cloudState.currentLocation, ...(loaded.currentLocation || {}) },
       gmailOAuth: { ...cloudState.gmailOAuth, ...(loaded.gmailOAuth || {}) },
     };
+    if (Array.isArray(cloudState.processedCommandIds)) {
+      for (const id of cloudState.processedCommandIds) processedCommandIdsSet.add(id);
+    }
   }
 } catch (e) {
   console.error("Error cargando cloud_state.json:", e.message);
@@ -153,6 +185,7 @@ async function loadStateFromMongo() {
         gmailOAuth: { ...cloudState.gmailOAuth, ...(doc.gmailOAuth || {}) },
         agendaTasks: Array.isArray(doc.agendaTasks) ? doc.agendaTasks : cloudState.agendaTasks,
         notifiedEmailIds: Array.isArray(doc.notifiedEmailIds) ? doc.notifiedEmailIds : cloudState.notifiedEmailIds,
+        processedCommandIds: Array.isArray(doc.processedCommandIds) ? doc.processedCommandIds : cloudState.processedCommandIds,
         lastEmailContext: doc.lastEmailContext || cloudState.lastEmailContext,
         recentFetchedEmails: Array.isArray(doc.recentFetchedEmails) ? doc.recentFetchedEmails : cloudState.recentFetchedEmails,
         lilaNotificationGroupJid: doc.lilaNotificationGroupJid || cloudState.lilaNotificationGroupJid,
@@ -163,6 +196,9 @@ async function loadStateFromMongo() {
         momPhoneDigits: doc.momPhoneDigits || MOM_PHONE_DIGITS,
         telegramBotToken: doc.telegramBotToken || TELEGRAM_BOT_TOKEN,
       };
+      if (Array.isArray(cloudState.processedCommandIds)) {
+        for (const id of cloudState.processedCommandIds) processedCommandIdsSet.add(id);
+      }
       console.log(`[LILA] 🍃 Estado cargado desde MongoDB: ${cloudState.agendaTasks.length} tareas en agenda.`);
     }
 
@@ -367,7 +403,7 @@ function createSimpleCache(maxEntries = 3000) {
 const msgRetryCounterCache = createSimpleCache(3000);
 const sentMessagesCache = new Map();
 
-function rememberMessage(msgObj) {
+function rememberMessage(msgObj, persistToMongo = false) {
   if (!msgObj?.key?.id) return;
   const id = msgObj.key.id;
   const remoteJid = msgObj.key.remoteJid || "";
@@ -383,8 +419,8 @@ function rememberMessage(msgObj) {
     sentMessagesCache.delete(firstKey);
   }
 
-  // Persistir en MongoDB para que si el teléfono de mamá pide reintento Signal tras un reinicio de Render, siempre tenga el mensaje
-  if (isMongoConnected && mongoDb && msgObj?.key?.fromMe) {
+  // Persistir en MongoDB únicamente los mensajes originados por LILA para reintentos Signal tras reinicios
+  if (persistToMongo && isMongoConnected && mongoDb && msgObj?.key?.fromMe) {
     mongoDb
       .collection("sent_messages_cache")
       .updateOne(
@@ -438,7 +474,7 @@ async function safeSendMessage(jid, content, options = {}) {
 
   const finalOptions = msgId ? { ...sendOpts, messageId: msgId } : sendOpts;
   const sent = await sock.sendMessage(target, content, finalOptions);
-  if (sent) rememberMessage(sent);
+  if (sent) rememberMessage(sent, true);
   scheduleSyncAuthToMongo(250);
   return sent;
 }
@@ -1697,21 +1733,26 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
     ? `Ubicación conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
     : "Ciudades habituales del Señor Carlos: Riohacha y Hatonuevo (La Guajira, Colombia).";
 
-  const lastMailInfo = cloudState.lastEmailContext
-    ? `\n9. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (para responder con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
-    : "";
+  const isEmailRelated = /\b(correo|correos|gmail|email|bandeja|responde|resp[oó]ndele|remitente|asunto)\b/i.test(
+    String(userPrompt || "")
+  );
+  const lastMailInfo =
+    isEmailRelated && cloudState.lastEmailContext
+      ? `\n10. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (solo si pide responder correo con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
+      : "";
 
   const systemPrompt =
     "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
     "=== REGLAS DE IDENTIDAD Y ACCIÓN INQUEBRANTABLES ===\n" +
     "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google. Tu creador es el Señor Carlos.\n" +
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
-    "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
+    "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp y Telegram) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
     "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos pide que le recuerdes algo hoy o a cierta hora (ej. 'recuérdame ir al gym a las 3 pm'), invoca SIEMPRE `schedule_whatsapp_message` con `target: 'lila_group'`, `time` en formato 24h ('15:00') y `recurring: false`. Si dice que tiene una entrega o examen para cierto día, agenda con `add_agenda_event`. NUNCA digas que vas a recordarle algo sin haber invocado `schedule_whatsapp_message` o `add_agenda_event`.\n" +
     "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira. NUNCA digas que enviaste o respondiste un correo sin haber invocado `send_or_reply_gmail`.\n" +
     "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en un grupo de WhatsApp (ej. 'Cuarto gamer'), invoca DE INMEDIATO `send_whatsapp_message` con el nombre del grupo en `target`.\n" +
     "7. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
-    `8. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${lastMailInfo}`;
+    "8. CONOCIMIENTO GENERAL ILIMITADO Y ASISTENCIA EN CHATS: Posees conocimiento experto sobre cualquier tema, plataforma digital, herramienta o software (como Animaker, Canva, programación, matemáticas, ciencia, historia, redacción de guiones, etc.). JAMÁS digas que 'tus capacidades están limitadas a los correos' ni que 'no tienes capacidad de navegar por internet para explicar algo'. Si el Señor Carlos te pide explicarle algo a él o a otra persona en un chat (ej. 'explícale qué es Animaker y cómo usarlo fácilmente'), responde directamente con una explicación clara, completa, práctica y paso a paso.\n" +
+    `9. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${lastMailInfo}`;
 
   const history = chatHistoryByJid.get(jid) || [];
   const geminiContents = [
@@ -1826,7 +1867,21 @@ async function generateSafeRoutineMessage(target, instruction) {
 }
 
 // --- INICIALIZACIÓN DE WHATSAPP (Baileys) - NUNCA BORRA SESIONES SIGNAL ---
+let reconnectTimer = null;
+
 async function startWhatsApp() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  if (sock) {
+    try {
+      sock.ev.removeAllListeners();
+      sock.end();
+    } catch (_) {}
+    sock = null;
+  }
+
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const origKeysSet = state.keys.set.bind(state.keys);
   state.keys.set = async (data) => {
@@ -1888,139 +1943,173 @@ async function startWhatsApp() {
       console.log(`[LILA] Desconectado (${statusCode}). Reconectando: ${shouldReconnect}`);
       if (shouldReconnect) {
         scheduleSyncAuthToMongo(500);
-        setTimeout(startWhatsApp, 3500);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          startWhatsApp().catch((err) => console.error("Error reconectando WhatsApp:", err.message));
+        }, 3500);
       } else {
         if (fs.existsSync(AUTH_FOLDER)) {
           fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
         }
         await clearAuthFromMongo();
-        setTimeout(startWhatsApp, 2000);
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(() => {
+          startWhatsApp().catch((err) => console.error("Error reiniciando WhatsApp:", err.message));
+        }, 2000);
       }
     }
   });
 
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    for (const msg of messages) {
-      if (msg?.message) rememberMessage(msg);
-    }
-    if (type !== "notify") return;
-
-    for (const msg of messages) {
-      if (!msg.message) continue;
-      const remoteJid = msg.key.remoteJid || "";
-      if (remoteJid === "status@broadcast") continue;
-
-      const participantJid = msg.key.participant || "";
-      const isGroup = remoteJid.endsWith("@g.us");
-      const isOwnerOrSelf =
-        Boolean(msg.key.fromMe) ||
-        Boolean(OWNER_PHONE && participantJid.includes(OWNER_PHONE)) ||
-        Boolean(connectedNumber && participantJid.includes(connectedNumber)) ||
-        (!isGroup &&
-          ((OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
-            (connectedNumber && remoteJid.includes(connectedNumber)) ||
-            remoteJid.endsWith("@lid")));
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        msg.message.imageMessage?.caption ||
-        "";
-      if (!text) continue;
-
-      const pushName = msg.pushName || (participantJid ? participantJid.split("@")[0] : remoteJid.split("@")[0]);
-      const { timeStr: nowCol } = getColombiaNowParts();
-
-      if (!msg.key.fromMe && pushName && remoteJid.endsWith("@s.whatsapp.net")) {
-        const cleanPush = pushName.toLowerCase().trim();
-        if (cleanPush && cleanPush !== "hermana") {
-          cloudState.learnedContacts[cleanPush] = remoteJid;
-          saveCloudState();
-        }
+    try {
+      for (const msg of messages) {
+        if (msg?.message) rememberMessage(msg, false);
       }
+      if (type !== "notify") return;
 
-      if (!msg.key.fromMe) {
-        inboxMessages.push({ from: pushName, jid: remoteJid, body: text, time: nowCol, timestamp: Date.now() });
-        if (inboxMessages.length > 50) inboxMessages.shift();
-      }
+      for (const msg of messages) {
+        if (!msg.message) continue;
+        const msgId = msg.key?.id || "";
+        const remoteJid = msg.key?.remoteJid || "";
+        if (remoteJid === "status@broadcast") continue;
 
-      const cleanText = text.trim();
-      if (cleanText.startsWith("🤖 *LILA:*")) continue;
+        // 1. FILTRO DE EDAD DEL MENSAJE (Evita que al reconectar o sincronizar WhatsApp Web responda comandos de hace 1 hora)
+        const rawTs = msg.messageTimestamp;
+        const msgEpochSec =
+          typeof rawTs === "number"
+            ? rawTs
+            : typeof rawTs?.toNumber === "function"
+            ? rawTs.toNumber()
+            : Number(rawTs) || 0;
+        const nowEpochSec = Math.floor(Date.now() / 1000);
+        const msgAgeSeconds = msgEpochSec > 0 ? nowEpochSec - msgEpochSec : 0;
 
-      const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
-      if (!isCommandForLila) continue;
+        const participantJid = msg.key.participant || "";
+        const isGroup = remoteJid.endsWith("@g.us");
+        const isOwnerOrSelf =
+          Boolean(msg.key.fromMe) ||
+          Boolean(OWNER_PHONE && participantJid.includes(OWNER_PHONE)) ||
+          Boolean(connectedNumber && participantJid.includes(connectedNumber)) ||
+          (!isGroup &&
+            ((OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
+              (connectedNumber && remoteJid.includes(connectedNumber)) ||
+              remoteJid.endsWith("@lid")));
 
-      const rawQuery = cleanText.replace(/^lila[,:\s]*/i, "").trim();
+        const innerMsg = msg.message.deviceSentMessage?.message || msg.message;
+        const text =
+          innerMsg.conversation ||
+          innerMsg.extendedTextMessage?.text ||
+          innerMsg.imageMessage?.caption ||
+          "";
+        if (!text) continue;
 
-      // --- NIVEL 1: MODO CREADOR (SOLO SEÑOR CARLOS) ---
-      if (isOwnerOrSelf) {
-        if (isGroup && !cloudState.lilaNotificationGroupJid) {
-          syncWhatsAppGroups().catch(() => {});
-        }
+        const pushName = msg.pushName || (participantJid ? participantJid.split("@")[0] : remoteJid.split("@")[0]);
+        const { timeStr: nowCol } = getColombiaNowParts();
 
-        // Interruptor de voz/texto para prender o apagar el Modo Invitado
-        if (/(apaga|desactiva|silencia|bloquea).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
-          cloudState.guestModeEnabled = false;
-          saveCloudState();
-          await safeSendMessage(
-            remoteJid,
-            {
-              text: "🤖 *LILA:* Modo invitado *desactivado*, Señor Carlos. A partir de este momento ignoraré a terceros y solo atenderé sus órdenes.",
-            },
-            { quoted: msg }
-          );
-          continue;
-        }
-        if (/(activa|prende|enciende|habilita).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
-          cloudState.guestModeEnabled = true;
-          saveCloudState();
-          await safeSendMessage(
-            remoteJid,
-            {
-              text: `🤖 *LILA:* Modo invitado *activado*, Señor Carlos. Responderé a sus amigos cuando me llamen (máximo ${GUEST_MAX_MSGS_PER_HOUR} mensajes por hora y sin acceso a ninguna función privada).`,
-            },
-            { quoted: msg }
-          );
-          continue;
-        }
-
-        const query = rawQuery || "Hola Lila, ¿estás activa?";
-        const historyKey = remoteJid || "owner_self";
-        const sendIntermediate = async (partialText) => {
-          if (partialText && partialText.trim()) {
-            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
+        if (!msg.key.fromMe && pushName && remoteJid.endsWith("@s.whatsapp.net")) {
+          const cleanPush = pushName.toLowerCase().trim();
+          if (cleanPush && cleanPush !== "hermana") {
+            cloudState.learnedContacts[cleanPush] = remoteJid;
+            saveCloudState();
           }
-        };
-        const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
-        if (reply && reply.trim()) {
-          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
         }
-        continue;
-      }
 
-      // --- NIVEL 2: MODO INVITADO / AMIGOS EN GRUPOS (EJ. EIMAR) ---
-      if (!cloudState.guestModeEnabled) continue;
-
-      const senderKey = participantJid || remoteJid;
-      const rateCheck = checkGuestRateLimit(senderKey);
-      if (!rateCheck.allowed) {
-        if (rateCheck.limitJustReached) {
-          await safeSendMessage(
-            remoteJid,
-            {
-              text: `🤖 *LILA:* Hola ${pushName}, he alcanzado mi límite de ${GUEST_MAX_MSGS_PER_HOUR} respuestas por hora en modo invitado para conservar energía. Por ahora quedo atenta únicamente a mi creador, el Señor Carlos.`,
-            },
-            { quoted: msg }
-          );
+        if (!msg.key.fromMe) {
+          inboxMessages.push({ from: pushName, jid: remoteJid, body: text, time: nowCol, timestamp: Date.now() });
+          if (inboxMessages.length > 50) inboxMessages.shift();
         }
-        continue;
-      }
 
-      const guestQuery = rawQuery || `Hola Lila, soy ${pushName}, preséntate brevemente.`;
-      const guestReply = await askLilaGuestAI(guestQuery, pushName, senderKey);
-      if (guestReply && guestReply.trim()) {
-        await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${guestReply.trim()}` }, { quoted: msg });
+        const cleanText = text.trim();
+        if (cleanText.startsWith("🤖 *LILA:*")) continue;
+
+        const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
+        if (!isCommandForLila) continue;
+
+        // 2. BLOQUEO ESTRICTO DE COMANDOS REPETIDOS O HISTÓRICOS (> 90 segundos)
+        if (hasProcessedCommand(msgId)) {
+          continue;
+        }
+        if (msgAgeSeconds > 90) {
+          markCommandProcessed(msgId);
+          console.log(`[LILA] ⏭️ Ignorando comando antiguo sincronizado (${msgAgeSeconds}s): "${cleanText.slice(0, 40)}"`);
+          continue;
+        }
+        markCommandProcessed(msgId);
+
+        const rawQuery = cleanText.replace(/^lila[,:\s]*/i, "").trim();
+
+        // --- NIVEL 1: MODO CREADOR (SOLO SEÑOR CARLOS) ---
+        if (isOwnerOrSelf) {
+          if (isGroup && !cloudState.lilaNotificationGroupJid) {
+            syncWhatsAppGroups().catch(() => {});
+          }
+
+          // Interruptor de voz/texto para prender o apagar el Modo Invitado
+          if (/(apaga|desactiva|silencia|bloquea).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
+            cloudState.guestModeEnabled = false;
+            saveCloudState();
+            await safeSendMessage(
+              remoteJid,
+              {
+                text: "🤖 *LILA:* Modo invitado *desactivado*, Señor Carlos. A partir de este momento ignoraré a terceros y solo atenderé sus órdenes.",
+              },
+              { quoted: msg }
+            );
+            continue;
+          }
+          if (/(activa|prende|enciende|habilita).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
+            cloudState.guestModeEnabled = true;
+            saveCloudState();
+            await safeSendMessage(
+              remoteJid,
+              {
+                text: `🤖 *LILA:* Modo invitado *activado*, Señor Carlos. Responderé a sus amigos cuando me llamen (máximo ${GUEST_MAX_MSGS_PER_HOUR} mensajes por hora y sin acceso a ninguna función privada).`,
+              },
+              { quoted: msg }
+            );
+            continue;
+          }
+
+          const query = rawQuery || "Hola Lila, ¿estás activa?";
+          const historyKey = remoteJid || "owner_self";
+          const sendIntermediate = async (partialText) => {
+            if (partialText && partialText.trim()) {
+              await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
+            }
+          };
+          const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
+          if (reply && reply.trim()) {
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
+          }
+          continue;
+        }
+
+        // --- NIVEL 2: MODO INVITADO / AMIGOS EN GRUPOS (EJ. EIMAR) ---
+        if (!cloudState.guestModeEnabled) continue;
+
+        const senderKey = participantJid || remoteJid;
+        const rateCheck = checkGuestRateLimit(senderKey);
+        if (!rateCheck.allowed) {
+          if (rateCheck.limitJustReached) {
+            await safeSendMessage(
+              remoteJid,
+              {
+                text: `🤖 *LILA:* Hola ${pushName}, he alcanzado mi límite de ${GUEST_MAX_MSGS_PER_HOUR} respuestas por hora en modo invitado para conservar energía. Por ahora quedo atenta únicamente a mi creador, el Señor Carlos.`,
+              },
+              { quoted: msg }
+            );
+          }
+          continue;
+        }
+
+        const guestQuery = rawQuery || `Hola Lila, soy ${pushName}, preséntate brevemente.`;
+        const guestReply = await askLilaGuestAI(guestQuery, pushName, senderKey);
+        if (guestReply && guestReply.trim()) {
+          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${guestReply.trim()}` }, { quoted: msg });
+        }
       }
+    } catch (err) {
+      console.error("[LILA] Error controlado en messages.upsert:", err.message);
     }
   });
 }
