@@ -185,6 +185,7 @@ async function loadStateFromMongo() {
 
       cloudState = {
         ...cloudState,
+        ...doc,
         learnedContacts: {
           ...cloudState.learnedContacts,
           ...(doc.learnedContacts || {}),
@@ -329,51 +330,36 @@ async function restoreAuthFromMongo() {
     if (files.length > 0) {
       if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
 
-      // Depurar pre-keys históricas acumuladas (>120 más recientes) para evitar inflar MongoDB y la RAM
-      const preKeyFiles = files
-        .filter((f) => /^pre-key-\d+\.json$/.test(f.fileName || ""))
-        .map((f) => ({
-          ...f,
-          num: Number((f.fileName.match(/^pre-key-(\d+)\.json$/) || [])[1] || 0),
-        }))
-        .sort((a, b) => b.num - a.num);
-
-      const stalePreKeyNames = new Set(preKeyFiles.slice(120).map((f) => f.fileName));
-      if (stalePreKeyNames.size > 0) {
-        await col.deleteMany({ fileName: { $in: [...stalePreKeyNames] } }).catch(() => {});
-        console.log(`[LILA] 🧹 Limpiadas ${stalePreKeyNames.size} pre-keys antiguas de MongoDB.`);
-      }
-
-      // Limpieza única post-suspensión de sesiones propias desincronizadas (evita "Session error: Bad MAC" en 218249585266876.0)
-      const selfCorruptedNames = new Set();
-      if (!cloudState.signalCleanedAfterOutageV2) {
-        for (const f of files) {
-          const fn = f.fileName || "";
-          if (
-            /^session-218249585266876\./.test(fn) ||
-            (OWNER_PHONE && fn.startsWith(`session-${OWNER_PHONE}.`)) ||
-            /^sender-key-/.test(fn)
-          ) {
-            selfCorruptedNames.add(fn);
-          }
-        }
-        if (selfCorruptedNames.size > 0) {
-          await col.deleteMany({ fileName: { $in: [...selfCorruptedNames] } }).catch(() => {});
-          console.log(`[LILA] 🔧 Purgadas ${selfCorruptedNames.size} sesiones propias/sender-keys con Bad MAC tras suspensión.`);
-        }
-        cloudState.signalCleanedAfterOutageV2 = true;
-        saveCloudState();
-      }
-
       let restoredCount = 0;
       for (const f of files) {
-        if (f.fileName && f.content && !stalePreKeyNames.has(f.fileName) && !selfCorruptedNames.has(f.fileName)) {
+        if (f.fileName && f.content) {
           const filePath = path.join(AUTH_FOLDER, f.fileName);
           fs.writeFileSync(filePath, f.content, "utf-8");
           lastSyncedAuthContent.set(f.fileName, f.content);
           restoredCount++;
         }
       }
+
+      // Alinear firstUnuploadedPreKeyId con nextPreKeyId si falta la pre-key inicial en disco (repara sendRetryRequest y uploadPreKeys)
+      const credsPath = path.join(AUTH_FOLDER, "creds.json");
+      if (fs.existsSync(credsPath)) {
+        try {
+          const credsObj = JSON.parse(fs.readFileSync(credsPath, "utf-8"));
+          if (
+            credsObj &&
+            typeof credsObj.nextPreKeyId === "number" &&
+            typeof credsObj.firstUnuploadedPreKeyId === "number"
+          ) {
+            const firstPkFile = path.join(AUTH_FOLDER, `pre-key-${credsObj.firstUnuploadedPreKeyId}.json`);
+            if (!fs.existsSync(firstPkFile) || credsObj.firstUnuploadedPreKeyId < credsObj.nextPreKeyId) {
+              credsObj.firstUnuploadedPreKeyId = credsObj.nextPreKeyId;
+              fs.writeFileSync(credsPath, JSON.stringify(credsObj), "utf-8");
+              console.log(`[LILA] 🔑 Puntero PreKey alineado en ID ${credsObj.nextPreKeyId} para reintentos Signal limpios.`);
+            }
+          }
+        } catch (_) {}
+      }
+
       console.log(`[LILA] 🍃 ${restoredCount} archivos activos de sesión de WhatsApp restaurados desde MongoDB.`);
     }
 
@@ -2589,7 +2575,7 @@ async function startWhatsApp() {
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
       console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
       if (typeof sock.uploadPreKeys === "function") {
-        sock.uploadPreKeys(30).catch(() => {});
+        sock.uploadPreKeys(100).catch(() => {});
       }
       scheduleSyncAuthToMongo(500);
       setTimeout(async () => {
@@ -2601,13 +2587,13 @@ async function startWhatsApp() {
           if (typeof sock.assertSessions === "function") {
             await sock.assertSessions(ownerJids, false).catch(() => {});
           }
-          if (!cloudState.whatsappHandshakeSentV3) {
-            cloudState.whatsappHandshakeSentV3 = true;
+          if (!cloudState.whatsappHandshakeSentV4) {
+            cloudState.whatsappHandshakeSentV4 = true;
             saveCloudState();
             const notifyJid = getOwnerNotificationJid();
             if (notifyJid) {
               await safeSendMessage(notifyJid, {
-                text: "🤖 *LILA:* ✅ Canal de cifrado Signal resincronizado y activo 24/7, Señor Carlos. Lista para recibir sus órdenes.",
+                text: "🤖 *LILA:* ✅ Puntero de llaves PreKey alineado y canal bidireccional activo 24/7, Señor Carlos.",
               }).catch((e) => console.error("[LILA] Error en saludo inicial grupo:", e.message));
             }
           }
