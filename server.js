@@ -324,14 +324,32 @@ async function restoreAuthFromMongo() {
     const files = await col.find({}).toArray();
     if (files.length > 0) {
       if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+
+      // Depurar pre-keys históricas acumuladas (>120 más recientes) para evitar inflar MongoDB y la RAM
+      const preKeyFiles = files
+        .filter((f) => /^pre-key-\d+\.json$/.test(f.fileName || ""))
+        .map((f) => ({
+          ...f,
+          num: Number((f.fileName.match(/^pre-key-(\d+)\.json$/) || [])[1] || 0),
+        }))
+        .sort((a, b) => b.num - a.num);
+
+      const stalePreKeyNames = new Set(preKeyFiles.slice(120).map((f) => f.fileName));
+      if (stalePreKeyNames.size > 0) {
+        await col.deleteMany({ fileName: { $in: [...stalePreKeyNames] } }).catch(() => {});
+        console.log(`[LILA] 🧹 Limpiadas ${stalePreKeyNames.size} pre-keys antiguas de MongoDB.`);
+      }
+
+      let restoredCount = 0;
       for (const f of files) {
-        if (f.fileName && f.content) {
+        if (f.fileName && f.content && !stalePreKeyNames.has(f.fileName)) {
           const filePath = path.join(AUTH_FOLDER, f.fileName);
           fs.writeFileSync(filePath, f.content, "utf-8");
           lastSyncedAuthContent.set(f.fileName, f.content);
+          restoredCount++;
         }
       }
-      console.log(`[LILA] 🍃 ${files.length} archivos de sesión de WhatsApp restaurados desde MongoDB.`);
+      console.log(`[LILA] 🍃 ${restoredCount} archivos activos de sesión de WhatsApp restaurados desde MongoDB.`);
     }
 
     // Restaurar caché de mensajes enviados para responder a cualquier solicitud Signal Retry tras reinicios
@@ -2342,8 +2360,9 @@ async function handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanTe
 
   // 1. ¿Hay una conversación delegada activa con este contacto?
   const delegated = activeDelegatedChats.get(remoteJid);
-  if (delegated && Date.now() - delegated.startedAt < 6 * 60 * 60 * 1000) {
-    delegated.turns += 1;
+  if (delegated && (!delegated.expiresAt || Date.now() < delegated.expiresAt)) {
+    delegated.turns = (delegated.turns || 0) + 1;
+    const prevMsg = delegated.lastMessageSent || delegated.history?.[0]?.text || "";
     const notifyJid = getOwnerNotificationJid();
     const sys =
       "Eres LILA, el asistente personal del Señor Carlos. Estás conversando por WhatsApp con " +
@@ -2358,7 +2377,7 @@ async function handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanTe
           role: "user",
           parts: [
             {
-              text: `Mensaje anterior enviado: "${delegated.lastMessageSent}"\nRespuesta recibida de ${pushName}: "${cleanText}"`,
+              text: `Mensaje anterior enviado: "${prevMsg}"\nRespuesta recibida de ${pushName}: "${cleanText}"`,
             },
           ],
         },
@@ -2551,13 +2570,19 @@ async function startWhatsApp() {
       for (const msg of messages) {
         if (msg?.message) rememberMessage(msg, false);
       }
-      if (type !== "notify") return;
+      if (type !== "notify" && type !== "append") return;
 
       for (const msg of messages) {
-        if (!msg.message) continue;
         const msgId = msg.key?.id || "";
         const remoteJid = msg.key?.remoteJid || "";
-        if (remoteJid === "status@broadcast") continue;
+        if (!remoteJid || remoteJid === "status@broadcast") continue;
+
+        if (!msg.message) {
+          if (msg.messageStubType === 2) {
+            console.log(`[LILA] 🔄 Re-sincronizando llave Signal (CIPHERTEXT) en ${remoteJid} (id: ${msgId})`);
+          }
+          continue;
+        }
 
         // 1. FILTRO DE EDAD DEL MENSAJE (Evita que al reconectar o sincronizar WhatsApp Web responda comandos de hace 1 hora)
         const rawTs = msg.messageTimestamp;
@@ -2581,11 +2606,23 @@ async function startWhatsApp() {
               (connectedNumber && remoteJid.includes(connectedNumber)) ||
               remoteJid.endsWith("@lid")));
 
-        const innerMsg = msg.message.deviceSentMessage?.message || msg.message;
+        let innerMsg = msg.message;
+        for (let depth = 0; depth < 4 && innerMsg; depth++) {
+          const next =
+            innerMsg.deviceSentMessage?.message ||
+            innerMsg.ephemeralMessage?.message ||
+            innerMsg.viewOnceMessage?.message ||
+            innerMsg.viewOnceMessageV2?.message ||
+            innerMsg.editedMessage?.message ||
+            innerMsg.documentWithCaptionMessage?.message;
+          if (!next) break;
+          innerMsg = next;
+        }
         const text =
-          innerMsg.conversation ||
-          innerMsg.extendedTextMessage?.text ||
-          innerMsg.imageMessage?.caption ||
+          innerMsg?.conversation ||
+          innerMsg?.extendedTextMessage?.text ||
+          innerMsg?.imageMessage?.caption ||
+          innerMsg?.videoMessage?.caption ||
           "";
         if (!text) continue;
 
@@ -2657,6 +2694,7 @@ async function startWhatsApp() {
           continue;
         }
         markCommandProcessed(msgId);
+        console.log(`[LILA] 📩 Comando recibido en ${remoteJid} (${type}, ${msgAgeSeconds}s): "${cleanText.slice(0, 60)}"`);
 
         const rawQuery = cleanText.replace(/^lila[,:\s]*/i, "").trim();
 
@@ -2900,7 +2938,7 @@ setInterval(pollGmailProactively, 5 * 60 * 1000);
 
 // Auto-keepalive
 setInterval(() => {
-  const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://lila-server-1.onrender.com";
+  const selfUrl = process.env.RENDER_EXTERNAL_URL || "https://lila-server-3vxd.onrender.com";
   fetch(`${selfUrl}/ping`).catch(() => {});
 }, 10 * 60 * 1000);
 
