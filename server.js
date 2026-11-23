@@ -177,7 +177,11 @@ async function loadStateFromMongo() {
       if (!OWNER_PHONE && doc.ownerPhone) OWNER_PHONE = String(doc.ownerPhone).replace(/\D/g, "");
       if (!MOM_LID_JID && doc.momLidJid) MOM_LID_JID = String(doc.momLidJid);
       if (!MOM_PHONE_DIGITS && doc.momPhoneDigits) MOM_PHONE_DIGITS = String(doc.momPhoneDigits);
-      if (!TELEGRAM_BOT_TOKEN && doc.telegramBotToken) TELEGRAM_BOT_TOKEN = String(doc.telegramBotToken).trim();
+      if (process.env.TELEGRAM_BOT_TOKEN) {
+        TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN).trim();
+      } else if (!TELEGRAM_BOT_TOKEN && doc.telegramBotToken) {
+        TELEGRAM_BOT_TOKEN = String(doc.telegramBotToken).trim();
+      }
 
       cloudState = {
         ...cloudState,
@@ -208,7 +212,7 @@ async function loadStateFromMongo() {
         ownerPhone: doc.ownerPhone || OWNER_PHONE,
         momLidJid: doc.momLidJid || MOM_LID_JID,
         momPhoneDigits: doc.momPhoneDigits || MOM_PHONE_DIGITS,
-        telegramBotToken: doc.telegramBotToken || TELEGRAM_BOT_TOKEN,
+        telegramBotToken: TELEGRAM_BOT_TOKEN || doc.telegramBotToken,
       };
       if (Array.isArray(cloudState.processedCommandIds)) {
         for (const id of cloudState.processedCommandIds) processedCommandIdsSet.add(id);
@@ -2085,6 +2089,32 @@ async function callGeminiWithFallback(
           continue;
         }
 
+        // Guardia anti-alucinación: si la IA afirma haber enviado un mensaje de WhatsApp sin haber llamado a send_whatsapp_message
+        const claimedWhatsAppSent =
+          /(he enviado el mensaje|ya le envi[eé] el mensaje|mensaje enviado a|acabo de enviarle|ya le escrib[ií] a)/i.test(
+            stepText
+          ) && /\b(whatsapp|grupo|mam[aá]|pechy|paula|perla|nelly)\b/i.test(`${userPromptText} ${stepText}`);
+        if (
+          enableTools &&
+          claimedWhatsAppSent &&
+          !calledTools.has("send_whatsapp_message") &&
+          !calledTools.has("delegate_conversation")
+        ) {
+          currentContents = [
+            ...currentContents,
+            { role: "model", parts: [{ text: stepText }] },
+            {
+              role: "user",
+              parts: [
+                {
+                  text: `[SISTEMA: Afirmaste haber enviado un mensaje de WhatsApp pero aún NO has ejecutado la herramienta 'send_whatsapp_message'. Invoca 'send_whatsapp_message' AHORA MISMO con 'target' y 'message' para enviarlo realmente.]`,
+                },
+              ],
+            },
+          ];
+          continue;
+        }
+
         if (stepText) return { ok: true, text: stepText };
         if (lastToolResultsSummary) return { ok: true, text: lastToolResultsSummary };
         break;
@@ -2562,8 +2592,26 @@ async function startWhatsApp() {
         sock.uploadPreKeys(30).catch(() => {});
       }
       scheduleSyncAuthToMongo(500);
-      setTimeout(() => {
-        syncWhatsAppGroups().catch(() => {});
+      setTimeout(async () => {
+        try {
+          await syncWhatsAppGroups();
+          const ownerNum = OWNER_PHONE || connectedNumber;
+          const ownerJids = ["218249585266876@lid"];
+          if (ownerNum) ownerJids.push(`${ownerNum}@s.whatsapp.net`);
+          if (typeof sock.assertSessions === "function") {
+            await sock.assertSessions(ownerJids, false).catch(() => {});
+          }
+          if (!cloudState.whatsappHandshakeSentV3) {
+            cloudState.whatsappHandshakeSentV3 = true;
+            saveCloudState();
+            const notifyJid = getOwnerNotificationJid();
+            if (notifyJid) {
+              await safeSendMessage(notifyJid, {
+                text: "🤖 *LILA:* ✅ Canal de cifrado Signal resincronizado y activo 24/7, Señor Carlos. Lista para recibir sus órdenes.",
+              }).catch((e) => console.error("[LILA] Error en saludo inicial grupo:", e.message));
+            }
+          }
+        } catch (_) {}
       }, 2500);
     }
     if (connection === "close") {
@@ -2604,45 +2652,7 @@ async function startWhatsApp() {
 
         if (!msg.message) {
           if (msg.messageStubType === 2) {
-            const candidateUsers = new Set(["218249585266876"]);
-            if (OWNER_PHONE) candidateUsers.add(OWNER_PHONE);
-            if (connectedNumber) candidateUsers.add(connectedNumber);
-            for (const rawJ of [
-              msg.key?.participant,
-              msg.key?.participantLid,
-              msg.key?.participantPn,
-              msg.key?.senderLid,
-              msg.key?.senderPn,
-              remoteJid.endsWith("@g.us") ? "" : remoteJid,
-            ]) {
-              if (rawJ) {
-                const u = String(rawJ).split("@")[0].split(":")[0];
-                if (u) candidateUsers.add(u);
-              }
-            }
-            const sessionResets = {};
-            for (const u of candidateUsers) {
-              sessionResets[`${u}.0`] = null;
-            }
-            try {
-              await signalKeyStore.set({
-                session: sessionResets,
-                ...(remoteJid.endsWith("@g.us") ? { "sender-key-memory": { [remoteJid]: null } } : {}),
-              });
-              if (remoteJid.endsWith("@g.us") && fs.existsSync(AUTH_FOLDER)) {
-                for (const fn of fs.readdirSync(AUTH_FOLDER)) {
-                  if (fn.startsWith(`sender-key-${remoteJid}`)) {
-                    try {
-                      fs.unlinkSync(path.join(AUTH_FOLDER, fn));
-                    } catch (_) {}
-                  }
-                }
-              }
-              if (typeof sock.uploadPreKeys === "function") {
-                await sock.uploadPreKeys(15).catch(() => {});
-              }
-              console.log(`[LILA] 🔄 Auto-reparada sesión Signal (Bad MAC / CIPHERTEXT) en ${remoteJid} (id: ${msgId})`);
-            } catch (_) {}
+            console.log(`[LILA] 🔄 Negociando llave Signal entrante en ${remoteJid} (id: ${msgId})`);
           }
           continue;
         }
