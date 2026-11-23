@@ -340,9 +340,30 @@ async function restoreAuthFromMongo() {
         console.log(`[LILA] 🧹 Limpiadas ${stalePreKeyNames.size} pre-keys antiguas de MongoDB.`);
       }
 
+      // Limpieza única post-suspensión de sesiones propias desincronizadas (evita "Session error: Bad MAC" en 218249585266876.0)
+      const selfCorruptedNames = new Set();
+      if (!cloudState.signalCleanedAfterOutageV2) {
+        for (const f of files) {
+          const fn = f.fileName || "";
+          if (
+            /^session-218249585266876\./.test(fn) ||
+            (OWNER_PHONE && fn.startsWith(`session-${OWNER_PHONE}.`)) ||
+            /^sender-key-/.test(fn)
+          ) {
+            selfCorruptedNames.add(fn);
+          }
+        }
+        if (selfCorruptedNames.size > 0) {
+          await col.deleteMany({ fileName: { $in: [...selfCorruptedNames] } }).catch(() => {});
+          console.log(`[LILA] 🔧 Purgadas ${selfCorruptedNames.size} sesiones propias/sender-keys con Bad MAC tras suspensión.`);
+        }
+        cloudState.signalCleanedAfterOutageV2 = true;
+        saveCloudState();
+      }
+
       let restoredCount = 0;
       for (const f of files) {
-        if (f.fileName && f.content && !stalePreKeyNames.has(f.fileName)) {
+        if (f.fileName && f.content && !stalePreKeyNames.has(f.fileName) && !selfCorruptedNames.has(f.fileName)) {
           const filePath = path.join(AUTH_FOLDER, f.fileName);
           fs.writeFileSync(filePath, f.content, "utf-8");
           lastSyncedAuthContent.set(f.fileName, f.content);
@@ -2494,12 +2515,13 @@ async function startWhatsApp() {
     scheduleSyncAuthToMongo(1500);
   };
   const { version } = await fetchLatestBaileysVersion();
+  const signalKeyStore = makeCacheableSignalKeyStore(state.keys, silentLogger);
 
   sock = makeWASocket({
     version,
     auth: {
       creds: state.creds,
-      keys: makeCacheableSignalKeyStore(state.keys, silentLogger),
+      keys: signalKeyStore,
     },
     logger: silentLogger,
     printQRInTerminal: true,
@@ -2536,6 +2558,9 @@ async function startWhatsApp() {
       latestQrDataUrl = null;
       connectedNumber = sock.user?.id?.split(":")[0] || "Conectado";
       console.log(`[LILA] ✅ WhatsApp conectado 24/7 (+${connectedNumber})`);
+      if (typeof sock.uploadPreKeys === "function") {
+        sock.uploadPreKeys(30).catch(() => {});
+      }
       scheduleSyncAuthToMongo(500);
       setTimeout(() => {
         syncWhatsAppGroups().catch(() => {});
@@ -2579,7 +2604,45 @@ async function startWhatsApp() {
 
         if (!msg.message) {
           if (msg.messageStubType === 2) {
-            console.log(`[LILA] 🔄 Re-sincronizando llave Signal (CIPHERTEXT) en ${remoteJid} (id: ${msgId})`);
+            const candidateUsers = new Set(["218249585266876"]);
+            if (OWNER_PHONE) candidateUsers.add(OWNER_PHONE);
+            if (connectedNumber) candidateUsers.add(connectedNumber);
+            for (const rawJ of [
+              msg.key?.participant,
+              msg.key?.participantLid,
+              msg.key?.participantPn,
+              msg.key?.senderLid,
+              msg.key?.senderPn,
+              remoteJid.endsWith("@g.us") ? "" : remoteJid,
+            ]) {
+              if (rawJ) {
+                const u = String(rawJ).split("@")[0].split(":")[0];
+                if (u) candidateUsers.add(u);
+              }
+            }
+            const sessionResets = {};
+            for (const u of candidateUsers) {
+              sessionResets[`${u}.0`] = null;
+            }
+            try {
+              await signalKeyStore.set({
+                session: sessionResets,
+                ...(remoteJid.endsWith("@g.us") ? { "sender-key-memory": { [remoteJid]: null } } : {}),
+              });
+              if (remoteJid.endsWith("@g.us") && fs.existsSync(AUTH_FOLDER)) {
+                for (const fn of fs.readdirSync(AUTH_FOLDER)) {
+                  if (fn.startsWith(`sender-key-${remoteJid}`)) {
+                    try {
+                      fs.unlinkSync(path.join(AUTH_FOLDER, fn));
+                    } catch (_) {}
+                  }
+                }
+              }
+              if (typeof sock.uploadPreKeys === "function") {
+                await sock.uploadPreKeys(15).catch(() => {});
+              }
+              console.log(`[LILA] 🔄 Auto-reparada sesión Signal (Bad MAC / CIPHERTEXT) en ${remoteJid} (id: ${msgId})`);
+            } catch (_) {}
           }
           continue;
         }
