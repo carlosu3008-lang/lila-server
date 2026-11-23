@@ -107,6 +107,16 @@ let cloudState = {
   lilaNotificationGroupJid: null,
   guestModeEnabled: true,
   telegramChatId: null,
+  relationships: {
+    hermana: ["nelly", "perla"],
+    mamá: ["paula"],
+    mama: ["paula"],
+  },
+  busyMode: {
+    active: false,
+    reason: "ocupado en este momento",
+    untilTimestamp: null,
+  },
 };
 
 const processedCommandIdsSet = new Set();
@@ -146,6 +156,8 @@ try {
       learnedContacts: { ...cloudState.learnedContacts, ...(loaded.learnedContacts || {}) },
       currentLocation: { ...cloudState.currentLocation, ...(loaded.currentLocation || {}) },
       gmailOAuth: { ...cloudState.gmailOAuth, ...(loaded.gmailOAuth || {}) },
+      relationships: { ...cloudState.relationships, ...(loaded.relationships || {}) },
+      busyMode: { ...cloudState.busyMode, ...(loaded.busyMode || {}) },
     };
     if (Array.isArray(cloudState.processedCommandIds)) {
       for (const id of cloudState.processedCommandIds) processedCommandIdsSet.add(id);
@@ -183,6 +195,8 @@ async function loadStateFromMongo() {
         },
         currentLocation: { ...cloudState.currentLocation, ...(doc.currentLocation || {}) },
         gmailOAuth: { ...cloudState.gmailOAuth, ...(doc.gmailOAuth || {}) },
+        relationships: { ...cloudState.relationships, ...(doc.relationships || {}) },
+        busyMode: { ...cloudState.busyMode, ...(doc.busyMode || {}) },
         agendaTasks: Array.isArray(doc.agendaTasks) ? doc.agendaTasks : cloudState.agendaTasks,
         notifiedEmailIds: Array.isArray(doc.notifiedEmailIds) ? doc.notifiedEmailIds : cloudState.notifiedEmailIds,
         processedCommandIds: Array.isArray(doc.processedCommandIds) ? doc.processedCommandIds : cloudState.processedCommandIds,
@@ -206,10 +220,26 @@ async function loadStateFromMongo() {
     const schedDocs = await schedCol.find({ active: true }).toArray();
     if (schedDocs && schedDocs.length > 0) {
       const existingIds = new Set(schedules.map((s) => s.id));
+      let migratedRoutine = false;
       for (const s of schedDocs) {
+        if (s.message === "Buenos días, Pechy. Espero que tengas un excelente día.") {
+          s.message = "Saludo diario de buenos días natural, cálido y variado para mi mamá Pechy";
+          s.useAI = true;
+          if (!Array.isArray(s.recentGreetings) || s.recentGreetings.length === 0) {
+            s.recentGreetings = ["Buenos días, Pechy. Espero que tengas un excelente día."];
+          }
+          migratedRoutine = true;
+        }
         if (!existingIds.has(s.id)) schedules.push(s);
       }
+      if (migratedRoutine) saveSchedules();
       console.log(`[LILA] 🍃 ${schedDocs.length} rutinas activas cargadas desde MongoDB.`);
+    }
+
+    const logsCol = mongoDb.collection("chat_logs");
+    const recentLogs = await logsCol.find({}).sort({ timestamp: -1 }).limit(120).toArray();
+    if (recentLogs && recentLogs.length > 0) {
+      inboxMessages.push(...recentLogs.reverse());
     }
   } catch (err) {
     console.error("Error cargando estado desde MongoDB:", err.message);
@@ -263,12 +293,13 @@ async function saveSchedules() {
   }
 }
 
-// --- PERSISTENCIA TOTAL DE LA SESIÓN DE WHATSAPP EN MONGODB (ATÓMICA CON BULKWRITE) ---
+// --- PERSISTENCIA DIFERENCIAL ULTRA-LIVIANA DE WHATSAPP EN MONGODB (AHORRA 99.8% DE ANCHO DE BANDA) ---
 let syncAuthTimeout = null;
 let isSyncingAuth = false;
 let pendingSyncAgain = false;
+const lastSyncedAuthContent = new Map();
 
-function scheduleSyncAuthToMongo(delayMs = 300) {
+function scheduleSyncAuthToMongo(delayMs = 12000) {
   if (syncAuthTimeout) clearTimeout(syncAuthTimeout);
   syncAuthTimeout = setTimeout(() => {
     syncAllAuthToMongo().catch(() => {});
@@ -276,6 +307,7 @@ function scheduleSyncAuthToMongo(delayMs = 300) {
 }
 
 async function clearAuthFromMongo() {
+  lastSyncedAuthContent.clear();
   if (!isMongoConnected || !mongoDb) return;
   try {
     await mongoDb.collection("whatsapp_auth").deleteMany({});
@@ -296,6 +328,7 @@ async function restoreAuthFromMongo() {
         if (f.fileName && f.content) {
           const filePath = path.join(AUTH_FOLDER, f.fileName);
           fs.writeFileSync(filePath, f.content, "utf-8");
+          lastSyncedAuthContent.set(f.fileName, f.content);
         }
       }
       console.log(`[LILA] 🍃 ${files.length} archivos de sesión de WhatsApp restaurados desde MongoDB.`);
@@ -303,7 +336,7 @@ async function restoreAuthFromMongo() {
 
     // Restaurar caché de mensajes enviados para responder a cualquier solicitud Signal Retry tras reinicios
     const sentCol = mongoDb.collection("sent_messages_cache");
-    const cachedMsgs = await sentCol.find({}).sort({ updatedAt: -1 }).limit(250).toArray();
+    const cachedMsgs = await sentCol.find({}).sort({ updatedAt: -1 }).limit(60).toArray();
     for (const doc of cachedMsgs) {
       if (doc.msgId && doc.messageContent) {
         sentMessagesCache.set(doc.msgId, doc.messageContent);
@@ -328,7 +361,7 @@ async function syncAllAuthToMongo() {
     const files = fs.readdirSync(AUTH_FOLDER);
     if (!files.includes("creds.json")) return;
     const col = mongoDb.collection("whatsapp_auth");
-    const currentFileNames = [];
+    const currentFileSet = new Set();
     const bulkOps = [];
     const nowIso = new Date().toISOString();
 
@@ -336,22 +369,36 @@ async function syncAllAuthToMongo() {
       const fullPath = path.join(AUTH_FOLDER, file);
       try {
         if (fs.statSync(fullPath).isFile()) {
-          currentFileNames.push(file);
+          currentFileSet.add(file);
           const content = fs.readFileSync(fullPath, "utf-8");
-          bulkOps.push({
-            updateOne: {
-              filter: { fileName: file },
-              update: { $set: { fileName: file, content, updatedAt: nowIso } },
-              upsert: true,
-            },
-          });
+          // Solo subir a MongoDB si el archivo realmente cambió en bytes (evita gastar los 5 GB de ancho de banda de Render)
+          if (lastSyncedAuthContent.get(file) !== content) {
+            lastSyncedAuthContent.set(file, content);
+            bulkOps.push({
+              updateOne: {
+                filter: { fileName: file },
+                update: { $set: { fileName: file, content, updatedAt: nowIso } },
+                upsert: true,
+              },
+            });
+          }
         }
       } catch (_) {}
     }
 
     if (bulkOps.length > 0) {
       await col.bulkWrite(bulkOps, { ordered: false });
-      await col.deleteMany({ fileName: { $nin: currentFileNames } });
+    }
+
+    const removedFiles = [];
+    for (const oldFile of lastSyncedAuthContent.keys()) {
+      if (!currentFileSet.has(oldFile)) {
+        removedFiles.push(oldFile);
+        lastSyncedAuthContent.delete(oldFile);
+      }
+    }
+    if (removedFiles.length > 0) {
+      await col.deleteMany({ fileName: { $in: removedFiles } });
     }
   } catch (err) {
     console.error("Error respaldando sesión en MongoDB:", err.message);
@@ -359,7 +406,7 @@ async function syncAllAuthToMongo() {
     isSyncingAuth = false;
     if (pendingSyncAgain) {
       pendingSyncAgain = false;
-      scheduleSyncAuthToMongo(250);
+      scheduleSyncAuthToMongo(5000);
     }
   }
 }
@@ -603,12 +650,26 @@ function isSelfOrOwnerTarget(str) {
   );
 }
 
-function resolveContactTarget(target) {
+function isFamilyVipJid(jid, pushName = "") {
+  const j = String(jid || "").toLowerCase();
+  const p = String(pushName || "").toLowerCase();
+  if (!j) return false;
+  if (MOM_LID_JID && j.includes(MOM_LID_JID.split("@")[0])) return true;
+  if (MOM_PHONE_DIGITS && j.includes(MOM_PHONE_DIGITS)) return true;
+  const perlaJid = cloudState.learnedContacts?.["perla"] || "";
+  const nellyJid = cloudState.learnedContacts?.["nelly"] || "";
+  if (perlaJid && j.includes(perlaJid.split("@")[0])) return true;
+  if (nellyJid && j.includes(nellyJid.split("@")[0])) return true;
+  if (["paula", "pechy", "mamá", "mama", "perla", "nelly", "hermana"].some((k) => p.includes(k))) return true;
+  return false;
+}
+
+function resolveContactTarget(target, _depth = 0) {
   if (!target) return { ok: false, error: "No se indicó destinatario." };
   const raw = String(target).trim();
   const lower = raw
     .toLowerCase()
-    .replace(/^(el\s+grupo\s+de\s+whatsapp|grupo\s+de\s+whatsapp|el\s+grupo|grupo|mi)\s+/i, "")
+    .replace(/^(el\s+grupo\s+de\s+whatsapp|grupo\s+de\s+whatsapp|el\s+grupo|grupo|mi|a\s+mi)\s+/i, "")
     .trim();
   const normTarget = normalizeSearchKey(lower);
 
@@ -622,6 +683,31 @@ function resolveContactTarget(target) {
       ok: false,
       ambiguous: true,
       error: "Señor Carlos, usted tiene dos hermanas: Nelly y Perla. ¿A cuál de las dos desea escribirle?",
+    };
+  }
+
+  // Resolución dinámica de relaciones aprendidas (ej. "prima" -> "Vero", "tía" -> "Carmen", etc.)
+  const relMap = cloudState.relationships || {};
+  const relEntry = relMap[lower] || relMap[normTarget];
+  if (relEntry && _depth < 2) {
+    const list = Array.isArray(relEntry) ? relEntry : [relEntry];
+    if (list.length === 1) {
+      return resolveContactTarget(list[0], _depth + 1);
+    }
+    if (list.length > 1) {
+      return {
+        ok: false,
+        ambiguous: true,
+        error: `Señor Carlos, usted tiene registradas varias personas como '${lower}': ${list.join(" y ")}. ¿A cuál de ellas se refiere?`,
+      };
+    }
+  }
+
+  if (["prima", "primo", "tía", "tia", "tío", "tio", "abuela", "abuelo", "novia", "papá", "papa", "hermano"].includes(lower) && !cloudState.learnedContacts[lower]) {
+    return {
+      ok: false,
+      ambiguous: true,
+      error: `Señor Carlos, aún no tengo asociado quién es su '${lower}'. ¿Me indica cómo se llama (ej. "mi ${lower} es Vero") para aprenderlo de forma permanente?`,
     };
   }
 
@@ -1195,13 +1281,94 @@ const CLOUD_TOOLS_DECLARATIONS = [
   },
   {
     name: "pause_or_cancel_routine",
-    description: "Pausa una rutina hasta cierta fecha (pauseUntil: 'YYYY-MM-DD') o cancela rutinas.",
+    description:
+      "Salta el envío de una rutina SOLO POR HOY (skipTodayOnly: true, ej. 'no le escribas hoy a mi mamá'), pausa hasta cierta fecha (pauseUntil: 'YYYY-MM-DD') o cancela definitivamente la rutina.",
     parameters: {
       type: "OBJECT",
       properties: {
-        target: { type: "STRING", description: "Contacto o ID a pausar o cancelar." },
-        pauseUntil: { type: "STRING", description: "Fecha 'YYYY-MM-DD' hasta la cual pausar." },
+        target: { type: "STRING", description: "Contacto o parentesco (ej. 'mamá', 'Paula', 'Pechy') o ID de la rutina." },
+        skipTodayOnly: { type: "BOOLEAN", description: "true si pidió NO escribirle hoy ('no le escribas hoy a mi mamá') pero mantener la rutina para los días siguientes." },
+        pauseUntil: { type: "STRING", description: "Fecha opcional 'YYYY-MM-DD' hasta la cual pausar." },
       },
+    },
+  },
+  {
+    name: "add_note_to_next_routine",
+    description:
+      "Agrega un encargo o nota especial para que se incluya de forma natural en el PRÓXIMO saludo automático de una rutina (ej. 'mañana cuando le escribas a mi mamá recuérdale traerme el perfume').",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        target: { type: "STRING", description: "Contacto de la rutina (ej. 'mamá', 'Paula', 'Pechy')." },
+        extraNote: { type: "STRING", description: "Nota o encargo a incluir en el próximo saludo (ej. 'recordarle que me traiga el perfume')." },
+      },
+      required: ["target", "extraNote"],
+    },
+  },
+  {
+    name: "save_contact_or_relationship",
+    description:
+      "Aprende y guarda permanentemente en MongoDB quién es un familiar/apodo (ej. 'mi prima es Vero') o registra el número de teléfono de un contacto nuevo.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        relationshipOrAlias: { type: "STRING", description: "Parentesco o apodo (ej. 'prima', 'tía', 'novia', 'mejor amigo') o vacío si solo guarda nombre." },
+        contactName: { type: "STRING", description: "Nombre de la persona (ej. 'Vero', 'Nelly')." },
+        phoneNumber: { type: "STRING", description: "Número de celular opcional si el Señor Carlos lo indicó." },
+      },
+      required: ["contactName"],
+    },
+  },
+  {
+    name: "get_chat_history",
+    description:
+      "Consulta los mensajes recibidos recientemente en WhatsApp de un contacto (ej. mamá, Perla, Eimar) o de un grupo para recordar qué dijeron o hacer un resumen.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        contactOrGroup: { type: "STRING", description: "Nombre del contacto o grupo a consultar (o vacío para ver todos los recientes)." },
+        limit: { type: "NUMBER", description: "Cantidad de mensajes a recuperar (por defecto 15)." },
+      },
+    },
+  },
+  {
+    name: "delegate_conversation",
+    description:
+      "Inicia una conversación delegada con un contacto: LILA le escribe la pregunta o mensaje indicado, queda escuchando su respuesta automáticamente y le informa al Señor Carlos lo que responda.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        target: { type: "STRING", description: "Nombre del contacto con quien hablar (ej. 'Eimar', 'Perla', 'Mamá')." },
+        initialMessage: { type: "STRING", description: "Primer mensaje que LILA le enviará de inmediato." },
+        objective: { type: "STRING", description: "Qué información o acuerdo debe conseguir LILA en esa charla." },
+      },
+      required: ["target", "initialMessage", "objective"],
+    },
+  },
+  {
+    name: "set_busy_mode",
+    description:
+      "Activa o desactiva el Modo Ocupado / Secretario Inteligente de LILA (con regla de 35s, prioridad Familia VIP, cero spam en grupos y detector de urgencias).",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        active: { type: "BOOLEAN", description: "true para activar modo ocupado; false para desactivarlo." },
+        reason: { type: "STRING", description: "Motivo (ej. 'en el gimnasio', 'en clase de Física', 'estudiando')." },
+        durationMinutes: { type: "NUMBER", description: "Duración opcional en minutos (ej. 120 para 2 horas) tras la cual se apaga solo." },
+      },
+      required: ["active"],
+    },
+  },
+  {
+    name: "search_web_live",
+    description:
+      "Busca información actualizada en tiempo real en Google/Internet sobre cualquier noticia, evento, precio, partido, herramienta o tema.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Consulta a buscar en tiempo real en Google." },
+      },
+      required: ["query"],
     },
   },
   {
@@ -1371,14 +1538,26 @@ async function executeCloudToolCall(name, args) {
       return await checkGmailLive(args?.query || "is:unread newer_than:2d", args?.account || "All");
     case "send_or_reply_gmail": {
       let rawTo = String(args?.to || "").trim();
-      let matchedEmail = findMatchingEmailContext(rawTo);
+      const lowerTo = rawTo.toLowerCase();
       let finalTo = rawTo;
 
-      // Extraer correo si viene como "Nombre <correo@dominio>" o buscar en el último correo leído si solo dieron el nombre ("Carlos")
-      const bracketMatch = rawTo.match(/<([^>]+@[^>]+)>/) || rawTo.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+      // 1. Resolver correos propios del Señor Carlos si pide enviarse a su cuenta Institucional o Personal
+      const ownerUniEmail = cloudState.ownerUniEmail || "curianae@uniguajira.edu.co";
+      const ownerPersonalEmail = cloudState.ownerPersonalEmail || "carlosuriana2007@gmail.com";
+
+      if (!rawTo.includes("@") && /(institucional|uniguajira|universidad|mi correo de la u|cuenta de la u|curianae)/i.test(lowerTo)) {
+        finalTo = ownerUniEmail;
+      } else if (!rawTo.includes("@") && /(mi personal|correo personal|cuenta personal|carlosuriana)/i.test(lowerTo)) {
+        finalTo = ownerPersonalEmail;
+      }
+
+      let matchedEmail = finalTo.includes("@") ? null : findMatchingEmailContext(rawTo);
+
+      // 2. Extraer correo si viene como "Nombre <correo@dominio>" o buscar en el último correo leído SOLO si es respuesta
+      const bracketMatch = finalTo.match(/<([^>]+@[^>]+)>/) || finalTo.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
       if (bracketMatch) {
         finalTo = bracketMatch[1].trim();
-      } else if (!rawTo.includes("@") && matchedEmail) {
+      } else if (!finalTo.includes("@") && matchedEmail) {
         const ctxMatch =
           (matchedEmail.emailAddress && matchedEmail.emailAddress.includes("@") ? matchedEmail.emailAddress : null) ||
           matchedEmail.from?.match(/<([^>]+@[^>]+)>/)?.[1] ||
@@ -1390,7 +1569,7 @@ async function executeCloudToolCall(name, args) {
         return `No se encontró una dirección de correo válida para '${rawTo || "el destinatario"}'. Por favor indique el correo electrónico.`;
       }
 
-      const isReply = Boolean(args?.isReply) || (!rawTo.includes("@") && Boolean(matchedEmail));
+      const isReply = Boolean(args?.isReply) && Boolean(matchedEmail);
       let threadId = null;
       let inReplyTo = null;
       let finalSubject = String(args?.subject || "").trim();
@@ -1404,7 +1583,7 @@ async function executeCloudToolCall(name, args) {
       }
       if (!finalSubject) finalSubject = "Mensaje del Señor Carlos";
 
-      const accountToUse = args?.account || matchedEmail?.account || "Personal";
+      const accountToUse = args?.account || (isReply ? matchedEmail?.account : null) || "Personal";
       const sent = await sendOrReplyGmail({
         to: finalTo,
         subject: finalSubject,
@@ -1436,7 +1615,9 @@ async function executeCloudToolCall(name, args) {
         (s) =>
           `- Para: *${s.contactName || s.target}* | Hora: *${s.time}* (${
             s.recurring ? "Todos los días" : s.specificDate || "Una vez"
-          }) | Mensaje/Instrucción: "${s.message}"${s.pauseUntil ? ` [Pausada hasta ${s.pauseUntil}]` : ""}`
+          }) | Instrucción: "${s.message}"${
+            s.nextRunExtraNote ? ` | ✨ Nota extra próximo envío: "${s.nextRunExtraNote}"` : ""
+          }${s.pauseUntil ? ` [Pausada hasta ${s.pauseUntil}]` : ""}`
       );
       return `Rutinas activas programadas (${activeList.length}):\n` + lines.join("\n");
     }
@@ -1481,6 +1662,8 @@ async function executeCloudToolCall(name, args) {
         recurring: isRecurring,
         useAI: Boolean(args.useAI),
         pauseUntil: null,
+        nextRunExtraNote: null,
+        recentGreetings: [],
         active: true,
         lastSentDate: initialLastSentDate,
       };
@@ -1497,22 +1680,174 @@ async function executeCloudToolCall(name, args) {
       }).`;
     }
     case "pause_or_cancel_routine": {
-      const filter = String(args?.target || "").toLowerCase().trim();
+      const rawFilter = String(args?.target || "").trim();
+      const filter = rawFilter.toLowerCase();
+      const resolved = rawFilter ? resolveContactTarget(rawFilter) : { ok: false };
+      const resolvedJid = resolved.ok ? resolved.jid : null;
       const pauseUntil = args?.pauseUntil ? String(args.pauseUntil).trim() : null;
+      const skipTodayOnly = Boolean(args?.skipTodayOnly);
+      const { dateStr: todayStr } = getColombiaNowParts();
+
       let count = 0;
+      const matchedNames = [];
       for (const s of schedules) {
         if (!s.active) continue;
-        const matches = !filter || String(s.target).includes(filter) || String(s.contactName).toLowerCase().includes(filter);
+        const sTarget = String(s.target || "").toLowerCase();
+        const sName = String(s.contactName || "").toLowerCase();
+        const matches =
+          !filter ||
+          sTarget.includes(filter) ||
+          sName.includes(filter) ||
+          (resolvedJid && (sTarget.includes(resolvedJid.split("@")[0]) || toWhatsAppJid(s.target) === resolvedJid));
+
         if (matches) {
-          if (pauseUntil) s.pauseUntil = pauseUntil;
-          else s.active = false;
+          if (skipTodayOnly) {
+            s.lastSentDate = todayStr;
+          } else if (pauseUntil) {
+            s.pauseUntil = pauseUntil;
+          } else {
+            s.active = false;
+          }
+          matchedNames.push(s.contactName || s.target);
           count++;
         }
       }
       saveSchedules();
+      if (count === 0) {
+        return `No encontré ninguna rutina activa que coincida con '${rawFilter || "ese contacto"}'.`;
+      }
+      if (skipTodayOnly) {
+        return `Entendido, Señor Carlos. Hoy (${todayStr}) no se enviará la rutina programada para ${matchedNames.join(", ")}; mañana continuará normalmente.`;
+      }
       return pauseUntil
-        ? `Se pausaron ${count} rutina(s) hasta el ${pauseUntil}.`
-        : `Se cancelaron ${count} rutina(s).`;
+        ? `Se pausó la rutina de ${matchedNames.join(", ")} hasta el ${pauseUntil}.`
+        : `Se canceló definitivamente la rutina de ${matchedNames.join(", ")}.`;
+    }
+    case "add_note_to_next_routine": {
+      const rawTarget = String(args?.target || "mamá").trim();
+      const extraNote = String(args?.extraNote || "").trim();
+      const filter = rawTarget.toLowerCase();
+      const resolved = resolveContactTarget(rawTarget);
+      const resolvedJid = resolved.ok ? resolved.jid : null;
+
+      let matchedRoutine = null;
+      for (const s of schedules) {
+        if (!s.active || s.parentEventId) continue;
+        const sTarget = String(s.target || "").toLowerCase();
+        const sName = String(s.contactName || "").toLowerCase();
+        if (
+          sTarget.includes(filter) ||
+          sName.includes(filter) ||
+          (resolvedJid && (sTarget.includes(resolvedJid.split("@")[0]) || toWhatsAppJid(s.target) === resolvedJid))
+        ) {
+          matchedRoutine = s;
+          break;
+        }
+      }
+      if (!matchedRoutine) {
+        return `No encontré una rutina activa para '${rawTarget}' a la cual agregarle la nota.`;
+      }
+      matchedRoutine.nextRunExtraNote = extraNote;
+      matchedRoutine.useAI = true;
+      saveSchedules();
+      return `¡Listo, Señor Carlos! En el próximo saludo de las ${matchedRoutine.time} para '${matchedRoutine.contactName}' incluiré de forma natural el encargo: "${extraNote}" (y se borrará automáticamente después de enviarlo).`;
+    }
+    case "save_contact_or_relationship": {
+      const rel = String(args?.relationshipOrAlias || "")
+        .toLowerCase()
+        .replace(/^(mi|el|la)\s+/i, "")
+        .trim();
+      const cName = String(args?.contactName || "").trim();
+      const cleanNameKey = cName.toLowerCase();
+      const phone = String(args?.phoneNumber || "").replace(/\D/g, "");
+
+      if (phone.length >= 10) {
+        const formattedPhone = phone.length === 10 && phone.startsWith("3") ? `57${phone}` : phone;
+        cloudState.learnedContacts[cleanNameKey] = `${formattedPhone}@s.whatsapp.net`;
+      }
+
+      if (rel) {
+        if (!cloudState.relationships) cloudState.relationships = {};
+        const existing = cloudState.relationships[rel];
+        const arr = Array.isArray(existing) ? existing : existing ? [existing] : [];
+        if (!arr.map((x) => x.toLowerCase()).includes(cleanNameKey)) {
+          arr.push(cName);
+        }
+        cloudState.relationships[rel] = arr;
+      }
+      saveCloudState();
+      const foundJid = cloudState.learnedContacts[cleanNameKey];
+      return `Aprendido permanentemente en MongoDB: ${rel ? `'${rel}' corresponde a '${cName}'` : `'${cName}'`}${
+        foundJid ? ` (chat vinculado: ${foundJid})` : " (cuando me indique su número o le escriba, vincularé también su chat)"
+      }.`;
+    }
+    case "get_chat_history": {
+      const queryTarget = String(args?.contactOrGroup || "").trim();
+      const limit = Math.min(Math.max(Number(args?.limit) || 15, 3), 40);
+      let filtered = [...inboxMessages];
+
+      if (queryTarget) {
+        const lowerQ = queryTarget.toLowerCase();
+        const resolved = resolveContactTarget(queryTarget);
+        const resolvedJid = resolved.ok ? resolved.jid : null;
+        filtered = filtered.filter((m) => {
+          const mFrom = String(m.from || "").toLowerCase();
+          const mJid = String(m.jid || "").toLowerCase();
+          return (
+            mFrom.includes(lowerQ) ||
+            mJid.includes(lowerQ) ||
+            (resolvedJid && mJid.includes(resolvedJid.split("@")[0]))
+          );
+        });
+      }
+
+      const recentSlice = filtered.slice(-limit);
+      if (recentSlice.length === 0) {
+        return queryTarget
+          ? `No tengo mensajes recientes registrados de '${queryTarget}' en mi historial.`
+          : "No hay mensajes recientes registrados en el historial.";
+      }
+      const lines = recentSlice.map(
+        (m) => `[${m.dateStr || ""} ${m.time || ""}] ${m.from}: "${m.body}"`
+      );
+      return `Historial de mensajes recientes${queryTarget ? ` de '${queryTarget}'` : ""} (${recentSlice.length}):\n` + lines.join("\n");
+    }
+    case "delegate_conversation": {
+      const resolved = await resolveContactTargetAsync(args.target);
+      if (!resolved.ok) return resolved.error;
+      const initialMsg = String(args.initialMessage || "").trim();
+      const objective = String(args.objective || "").trim();
+
+      await safeSendMessage(resolved.jid, { text: initialMsg });
+      activeDelegatedChats.set(resolved.jid, {
+        jid: resolved.jid,
+        contactName: resolved.canonicalName || args.target,
+        objective,
+        history: [{ role: "lila", text: initialMsg }],
+        expiresAt: Date.now() + 60 * 60 * 1000, // 1 hora de escucha activa
+        turns: 0,
+      });
+      return `Conversación delegada iniciada con '${resolved.canonicalName}'. Ya le envié: "${initialMsg}" y quedo atenta a su respuesta para atenderla e informarle en el grupo LILA.`;
+    }
+    case "set_busy_mode": {
+      const isActive = Boolean(args?.active);
+      const reason = String(args?.reason || "ocupado en este momento").trim();
+      const durationMins = Number(args?.durationMinutes) || 0;
+      cloudState.busyMode = {
+        active: isActive,
+        reason,
+        untilTimestamp: isActive && durationMins > 0 ? Date.now() + durationMins * 60 * 1000 : null,
+      };
+      busyAutoRepliedAt.clear();
+      saveCloudState();
+      if (!isActive) {
+        return "Modo Ocupado desactivado, Señor Carlos. Ya no responderé automáticamente en sus chats privados.";
+      }
+      const durText = durationMins > 0 ? ` durante ${durationMins} minutos` : "";
+      return `Modo Ocupado activado (${reason}${durText}). Atenderé únicamente chats privados (con espera de 35s, prioridad Familia VIP, pausa automática si usted chatea y cero spam en grupos).`;
+    }
+    case "search_web_live": {
+      return await searchWebLive(String(args?.query || ""));
     }
     case "send_whatsapp_message": {
       const resolved = await resolveContactTargetAsync(args.target);
@@ -1726,6 +2061,86 @@ async function callGeminiWithFallback(
   return { ok: false, error: lastError };
 }
 
+// --- MAPAS DE ESTADO EN MEMORIA PARA MODO OCUPADO INTELIGENTE Y CONVERSACIONES DELEGADAS ---
+const activeDelegatedChats = new Map();
+const busyAutoRepliedAt = new Map();
+const lastOwnerManualMessageByJid = new Map();
+const busyPendingTimers = new Map();
+
+// --- BÚSQUEDA WEB EN TIEMPO REAL (Gemini Google Search Grounding + Respaldo Wikipedia/DDG) ---
+async function searchWebLive(query) {
+  const cleanQ = String(query || "").trim();
+  if (!cleanQ) return "No se proporcionó consulta de búsqueda.";
+
+  if (GEMINI_API_KEY) {
+    const models = ["gemini-2.5-flash", "gemini-2.0-flash"];
+    for (const modelName of models) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: `Busca en internet información actualizada y verificada en español sobre: "${cleanQ}". Resume los datos clave con fechas, cifras o hechos exactos.`,
+                  },
+                ],
+              },
+            ],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2, maxOutputTokens: 600 },
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const parts = data?.candidates?.[0]?.content?.parts || [];
+          const text = parts
+            .filter((p) => p.text)
+            .map((p) => p.text)
+            .join("\n")
+            .trim();
+          if (text) return text;
+        }
+      } catch (_) {}
+    }
+  }
+
+  try {
+    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(cleanQ)}&format=json&no_html=1&kl=co-es`;
+    const ddgRes = await fetch(ddgUrl);
+    if (ddgRes.ok) {
+      const ddg = await ddgRes.json();
+      if (ddg?.AbstractText) return `${ddg.AbstractText} (Fuente: ${ddg.AbstractSource || "Web"})`;
+    }
+  } catch (_) {}
+
+  try {
+    const wikiSearchUrl = `https://es.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+      cleanQ
+    )}&utf8=&format=json&origin=*`;
+    const wsRes = await fetch(wikiSearchUrl);
+    if (wsRes.ok) {
+      const wsData = await wsRes.json();
+      const firstTitle = wsData?.query?.search?.[0]?.title;
+      if (firstTitle) {
+        const sumRes = await fetch(
+          `https://es.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(firstTitle)}`
+        );
+        if (sumRes.ok) {
+          const sumData = await sumRes.json();
+          if (sumData?.extract) return `${sumData.extract} (Fuente: Wikipedia - ${firstTitle})`;
+        }
+      }
+    }
+  } catch (_) {}
+
+  return `Consulta procesada para "${cleanQ}". Responde utilizando tu conocimiento general actualizado.`;
+}
+
 // --- CEREBRO CONVERSACIONAL DE LILA EN LA NUBE ---
 async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, onProgress = null) {
   const { dateStr, timeStr, readable } = getColombiaNowParts();
@@ -1738,8 +2153,38 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
   );
   const lastMailInfo =
     isEmailRelated && cloudState.lastEmailContext
-      ? `\n10. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (solo si pide responder correo con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
+      ? `\n12. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (solo si pide responder correo con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
       : "";
+
+  const ownerUniEmail = cloudState.ownerUniEmail || "curianae@uniguajira.edu.co";
+  const ownerPersonalEmail = cloudState.ownerPersonalEmail || "carlosuriana2007@gmail.com";
+  const inExternalDirectChat =
+    jid &&
+    (jid.endsWith("@s.whatsapp.net") || jid.endsWith("@lid")) &&
+    (!OWNER_PHONE || !jid.includes(OWNER_PHONE));
+  const chatContextHint = inExternalDirectChat
+    ? `\nNOTA DE CONTEXTO DE CHAT ACTIVO: En este momento el Señor Carlos te está invocando DENTRO del chat directo (${jid}) con otra persona. Si te dice 'salúdala', 'saluda a mi hermana', 'Perla', 'explícale' o 'dile que...', tu respuesta de texto se enviará directamente en este mismo chat para que esa persona la lea; NO llames a send_whatsapp_message pidiendo su número porque YA estás dentro de su chat.`
+    : "";
+
+  const activeRoutinesList = schedules
+    .filter((s) => s.active && !s.parentEventId)
+    .map(
+      (s) =>
+        `[ID:${s.id} | Para: ${s.contactName || s.target} | Hora: ${s.time} | Diario:${Boolean(s.recurring)}${
+          s.lastSentDate === dateStr ? " | Omitida/Enviada hoy" : ""
+        }${s.nextRunExtraNote ? ` | Nota extra pendiente: "${s.nextRunExtraNote}"` : ""}]`
+    )
+    .join("; ");
+  const routinesInfo = activeRoutinesList
+    ? `\n10. RUTINAS ACTIVAS EN TU MEMORIA: ${activeRoutinesList}. Si el Señor Carlos dice 'no le escribas hoy a mi mamá' o 'cancela por hoy el saludo de mi mamá', invoca INMEDIATAMENTE \`pause_or_cancel_routine\` con \`target: 'mamá'\` y \`skipTodayOnly: true\` (sin hacer preguntas). Si dice 'mañana cuando le escribas a mi mamá recuérdale...' o 'agrégale al saludo de mi mamá...', invoca INMEDIATAMENTE \`add_note_to_next_routine\` con \`target: 'mamá'\` y el encargo en \`extraNote\`.`
+    : "";
+
+  const relPairs = Object.entries(cloudState.relationships || {})
+    .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(", ") : v}`)
+    .join(" | ");
+  const busyStatusStr = cloudState.busyMode?.active
+    ? `ACTIVO (Motivo: "${cloudState.busyMode.reason}")`
+    : "INACTIVO";
 
   const systemPrompt =
     "Eres LILA, el asistente personal de inteligencia artificial creado y desarrollado exclusivamente por el Señor Carlos (estudiante de Ingeniería de Sistemas).\n" +
@@ -1748,11 +2193,14 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
     "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp y Telegram) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
     "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos pide que le recuerdes algo hoy o a cierta hora (ej. 'recuérdame ir al gym a las 3 pm'), invoca SIEMPRE `schedule_whatsapp_message` con `target: 'lila_group'`, `time` en formato 24h ('15:00') y `recurring: false`. Si dice que tiene una entrega o examen para cierto día, agenda con `add_agenda_event`. NUNCA digas que vas a recordarle algo sin haber invocado `schedule_whatsapp_message` o `add_agenda_event`.\n" +
-    "5. CORREOS GMAIL: Puedes leer correos (`check_gmail`), y enviar o responder correos (`send_or_reply_gmail`) tanto en la cuenta Personal como en la de Uniguajira. NUNCA digas que enviaste o respondiste un correo sin haber invocado `send_or_reply_gmail`.\n" +
-    "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en un grupo de WhatsApp (ej. 'Cuarto gamer'), invoca DE INMEDIATO `send_whatsapp_message` con el nombre del grupo en `target`.\n" +
-    "7. FAMILIA: Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla (si dice 'mi hermana' sin decir cuál, pregúntale a cuál de las dos).\n" +
-    "8. CONOCIMIENTO GENERAL ILIMITADO Y ASISTENCIA EN CHATS: Posees conocimiento experto sobre cualquier tema, plataforma digital, herramienta o software (como Animaker, Canva, programación, matemáticas, ciencia, historia, redacción de guiones, etc.). JAMÁS digas que 'tus capacidades están limitadas a los correos' ni que 'no tienes capacidad de navegar por internet para explicar algo'. Si el Señor Carlos te pide explicarle algo a él o a otra persona en un chat (ej. 'explícale qué es Animaker y cómo usarlo fácilmente'), responde directamente con una explicación clara, completa, práctica y paso a paso.\n" +
-    `9. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${lastMailInfo}`;
+    `5. CORREOS GMAIL PROPIOS DEL SEÑOR CARLOS: Su correo Personal es '${ownerPersonalEmail}' y su correo Institucional/Uniguajira es '${ownerUniEmail}'. Si pide enviar un correo 'a mi institucional' o 'a mi cuenta de la universidad', el destinatario 'to' es SIEMPRE '${ownerUniEmail}' (jamás uses correos de terceros como comunicaciones@uniguajira.edu.co). Si pide enviar 'a mi correo personal', el destinatario 'to' es '${ownerPersonalEmail}'.\n` +
+    "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en OTRO grupo o contacto de WhatsApp (ej. 'escríbele en el grupo Cuarto gamer' o 'mándale un mensaje a mi mamá'), invoca `send_whatsapp_message` con el nombre en `target`.\n" +
+    `7. FAMILIA Y VÍNCULOS APRENDIDOS (${relPairs}): Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla. Si el Señor Carlos te enseña un vínculo nuevo (ej. 'mi prima es Vero' o 'el número de Vero es...'), invoca \`save_contact_or_relationship\` para aprenderlo permanentemente.\n` +
+    "8. MEMORIA DE CHATS, DELEGACIÓN Y MODO OCUPADO: Si el Señor Carlos pregunta qué le dijo alguien ('¿qué me dijo mi mamá?', '¿de qué hablaron en el grupo?'), invoca `get_chat_history`. Si te pide hablar con alguien para averiguar algo ('pregúntale a mi mamá qué hará de almuerzo y me avisas'), invoca `delegate_conversation`. Si dice que va a estar ocupado, durmiendo, en clase o en el gym ('activa modo ocupado porque estoy en clase'), invoca `set_busy_mode`. Estado actual del Modo Ocupado: " +
+    busyStatusStr +
+    ".\n" +
+    "9. BÚSQUEDA WEB EN TIEMPO REAL Y CONOCIMIENTO EXPERTA: Posees la herramienta `search_web_live` para buscar información en tiempo real en internet (noticias, precios, clima, resultados) y conocimiento experto sobre cualquier plataforma o software (como Animaker, Canva, programación, etc.). JAMÁS digas que tus capacidades están limitadas a los correos.\n" +
+    `11. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${routinesInfo}${chatContextHint}${lastMailInfo}`;
 
   const history = chatHistoryByJid.get(jid) || [];
   const geminiContents = [
@@ -1842,21 +2290,43 @@ async function askLilaGuestAI(guestQuery, guestName = "Invitado", jid = "guest")
   return `¡Hola, ${guestName}! Soy LILA, el asistente personal del Señor Carlos. En este momento estoy en modo de espera.`;
 }
 
-// --- GENERADOR CON ESTILO PERSONAL PARA RUTINAS HACIA CONTACTOS ---
-async function generateSafeRoutineMessage(target, instruction) {
+// --- GENERADOR CON ESTILO PERSONAL Y ANTI-REPETICIÓN PARA RUTINAS HACIA CONTACTOS ---
+async function generateSafeRoutineMessage(target, instruction, extraNote = null, recentGreetings = []) {
+  const { readable } = getColombiaNowParts();
   const targetLower = String(target || "").toLowerCase();
   const isMom =
     (MOM_PHONE_DIGITS && targetLower.includes(MOM_PHONE_DIGITS)) ||
     (MOM_LID_JID && targetLower.includes(MOM_LID_JID.split("@")[0])) ||
     ["mamá", "mama", "paula", "pechy", "madre"].some((k) => targetLower.includes(k));
-  const FALLBACK_GREETING = isMom ? "Hola Pechy, buenos días, ¿cómo amaneciste?" : "Hola, buenos días, ¿cómo amaneciste?";
+
+  const fallbacksMom = [
+    "Hola Pechy, buenos días, ¿cómo amaneciste hoy?",
+    "Buenos días, Pechy. ¿Cómo amaneciste? Espero que tengas un muy buen día.",
+    "Hola Pechy, ¿cómo amaneciste? Que te rinda mucho el día de hoy.",
+    "¡Buenos días, Pechy! ¿Qué tal amaneciste hoy?",
+    "Hola Pechy, buen día, ¿cómo amanecieron por allá?",
+  ];
+  const recentSet = new Set((recentGreetings || []).map((g) => String(g).trim()));
+  const availableFallback =
+    fallbacksMom.find((f) => !recentSet.has(f)) || fallbacksMom[Math.floor(Math.random() * fallbacksMom.length)];
+  const baseFallback = isMom ? availableFallback : "Hola, buenos días, ¿cómo amaneciste?";
+  const FALLBACK_GREETING = extraNote ? `${baseFallback} Por cierto, recuerda por favor: ${extraNote}.` : baseFallback;
 
   const styleRules = isMom
-    ? "Mensaje de Carlos para su mamá Paula ('Pechy'). Carlos habla normal, sobrio y respetuoso. Jamás uses 'mi amor', 'cariño' o frases cursis."
-    : "Mensaje en primera persona como Carlos. Tono natural, directo y sobrio. Prohibido 'mi amor'.";
+    ? "Redacta un mensaje de WhatsApp de parte de Carlos para su mamá Paula (a quien él llama 'Pechy'). Carlos le habla con cariño natural de hijo, sobrio, cálido y espontáneo (1 o 2 frases cortas). Jamás uses 'mi amor', 'tesoro' ni frases poéticas artificiales."
+    : "Redacta un mensaje de WhatsApp en primera persona como Carlos. Tono natural, directo y sobrio (1 o 2 frases). Prohibido usar 'mi amor'.";
 
-  const sys = `${styleRules}\nOrtografía impecable con tildes y signos completos. Devuelve solo el texto del mensaje sin comillas.`;
-  const prompt = `Instrucción: ${instruction}`;
+  const avoidStr =
+    Array.isArray(recentGreetings) && recentGreetings.length > 0
+      ? `\nPROHIBIDO REPETIR cualquiera de estos mensajes enviados en los días anteriores:\n- ${recentGreetings.join("\n- ")}\nUsa una estructura y palabras distintas hoy.`
+      : "";
+
+  const extraNoteStr = extraNote
+    ? `\nENCARGO ESPECIAL PARA INCLUIR HOY DE FORMA NATURAL EN EL MISMO MENSAJE: Además de saludar, debes incluir con total naturalidad este encargo de Carlos: "${extraNote}" (por ejemplo: "...Por cierto, acuérdate de traerme el perfume cuando vengas").`
+    : "";
+
+  const sys = `${styleRules}\nHoy es ${readable}.${avoidStr}${extraNoteStr}\nOrtografía impecable en español con tildes y signos ¿? ¡! completos. Devuelve ÚNICAMENTE el texto final del mensaje listo para enviar, sin comillas ni explicaciones.`;
+  const prompt = `Propósito del mensaje: ${instruction || "Saludo diario de buenos días variado y natural"}`;
 
   const gemRes = await callGeminiWithFallback(sys, [{ role: "user", parts: [{ text: prompt }] }], false);
   if (gemRes.ok && gemRes.text) {
@@ -1864,6 +2334,122 @@ async function generateSafeRoutineMessage(target, instruction) {
     if (candidate && !/error|señor carlos|nodo/i.test(candidate)) return candidate;
   }
   return FALLBACK_GREETING;
+}
+
+// --- GESTOR DE CONVERSACIONES DELEGADAS Y MODO OCUPADO INTELIGENTE (4 PROPUESTAS) ---
+async function handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanText, isGroup }) {
+  if (isGroup || !remoteJid) return;
+
+  // 1. ¿Hay una conversación delegada activa con este contacto?
+  const delegated = activeDelegatedChats.get(remoteJid);
+  if (delegated && Date.now() - delegated.startedAt < 6 * 60 * 60 * 1000) {
+    delegated.turns += 1;
+    const notifyJid = getOwnerNotificationJid();
+    const sys =
+      "Eres LILA, el asistente personal del Señor Carlos. Estás conversando por WhatsApp con " +
+      `'${delegated.contactName}' (${pushName}) para cumplir este encargo del Señor Carlos: "${delegated.objective}".\n` +
+      "Analiza la respuesta que acaba de enviar la persona. Si ya respondió lo que el Señor Carlos quería saber (o si ya quedó claro), " +
+      "responde un mensaje breve y amable de agradecimiento despidiéndote, e inicia tu respuesta interna con `[COMPLETADO]` seguido del mensaje para el contacto. " +
+      "Si todavía falta hacerle una pregunta breve para concretar el encargo (máximo 2 turnos), inicia con `[CONTINUAR]` seguido del mensaje para el contacto.";
+    const gemRes = await callGeminiWithFallback(
+      sys,
+      [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `Mensaje anterior enviado: "${delegated.lastMessageSent}"\nRespuesta recibida de ${pushName}: "${cleanText}"`,
+            },
+          ],
+        },
+      ],
+      false
+    );
+    let rawReply = gemRes.ok && gemRes.text ? gemRes.text.trim() : "[COMPLETADO] ¡Muchas gracias! Ya le aviso a Carlos.";
+    const isCompleted = rawReply.includes("[COMPLETADO]") || delegated.turns >= 2;
+    const replyToContact = rawReply.replace(/\[(COMPLETADO|CONTINUAR)\]/gi, "").trim();
+
+    if (replyToContact) {
+      await safeSendMessage(remoteJid, { text: replyToContact });
+      delegated.lastMessageSent = replyToContact;
+    }
+
+    const reportMsg = `🤝 *Reporte de Conversación Delegada (${delegated.contactName}):*\n• *Encargo:* ${delegated.objective}\n• *${pushName} respondió:* "${cleanText}"\n• *LILA contestó:* "${replyToContact}"`;
+    if (notifyJid) await safeSendMessage(notifyJid, { text: reportMsg });
+    if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, reportMsg);
+
+    if (isCompleted) {
+      activeDelegatedChats.delete(remoteJid);
+    }
+    return;
+  }
+
+  // 2. ¿Está activo el Modo Ocupado Inteligente?
+  if (!cloudState.busyMode?.active) return;
+  if (cloudState.busyMode.untilTimestamp && Date.now() > cloudState.busyMode.untilTimestamp) {
+    cloudState.busyMode.active = false;
+    cloudState.busyMode.untilTimestamp = null;
+    saveCloudState();
+    return;
+  }
+
+  // Propuesta 3: Pausa automática si el Señor Carlos ha escrito manualmente en este chat en los últimos 20 minutos
+  const lastManual = lastOwnerManualMessageByJid.get(remoteJid) || 0;
+  if (Date.now() - lastManual < 20 * 60 * 1000) {
+    return;
+  }
+
+  // Propuesta 1: Espera prudente de 35 segundos agrupando ráfagas de mensajes
+  let pending = busyPendingTimers.get(remoteJid);
+  if (pending) {
+    pending.texts.push(cleanText);
+    return;
+  }
+
+  pending = {
+    texts: [cleanText],
+    pushName,
+    timer: setTimeout(async () => {
+      busyPendingTimers.delete(remoteJid);
+      try {
+        if (!cloudState.busyMode?.active) return;
+        const manualNow = lastOwnerManualMessageByJid.get(remoteJid) || 0;
+        if (Date.now() - manualNow < 20 * 60 * 1000) return;
+
+        const combinedText = pending.texts.join(" / ");
+        const isVipFamily = isFamilyVipJid(remoteJid, pushName);
+        const lastAuto = busyAutoRepliedAt.get(remoteJid) || 0;
+        const cooldownMs = isVipFamily ? 30 * 60 * 1000 : 2 * 60 * 60 * 1000;
+        const isUrgent = /\b(urgente|emergencia|importante|ll[aá]mame|hospital|accidente|favor\s+grande|necesito\s+ya)\b/i.test(
+          combinedText
+        );
+
+        const notifyJid = getOwnerNotificationJid();
+        const reason = cloudState.busyMode.reason || "ocupado en una actividad";
+
+        if (Date.now() - lastAuto >= cooldownMs || isUrgent) {
+          busyAutoRepliedAt.set(remoteJid, Date.now());
+          const replyText = isVipFamily
+            ? `🤖 *LILA:* ¡Hola, ${pushName}! En este momento Carlos está ${reason}. Ya mismo le pasé tu mensaje con prioridad para que te responda apenas se desocupe. Si necesitas algo urgente, escríbeme por aquí y le mando una alerta inmediata.`
+            : `🤖 *LILA:* Hola, ${pushName}. Soy LILA, el asistente del Señor Carlos. En este momento él se encuentra ${reason} y no puede mirar el celular. Ya le dejé tu mensaje anotado; si es una urgencia, indícamelo y le enviaré una alerta prioritaria.`;
+          await safeSendMessage(remoteJid, { text: replyText });
+        }
+
+        // Propuestas 2 y 4: Notificación silenciosa al grupo LILA y Telegram con clasificación VIP / Urgencia
+        const alertHeader = isUrgent
+          ? `🚨 *URGENCIA EN MODO OCUPADO (${pushName}):*`
+          : isVipFamily
+          ? `❤️ *Mensaje VIP de Familia en Modo Ocupado (${pushName}):*`
+          : `📌 *Recado en Modo Ocupado (${pushName}):*`;
+        const summaryAlert = `${alertHeader}\n"${combinedText}"`;
+        if (notifyJid) await safeSendMessage(notifyJid, { text: summaryAlert });
+        if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, summaryAlert);
+      } catch (err) {
+        console.error("[LILA] Error en temporizador de Modo Ocupado:", err.message);
+      }
+    }, 35000),
+  };
+  busyPendingTimers.set(remoteJid, pending);
 }
 
 // --- INICIALIZACIÓN DE WHATSAPP (Baileys) - NUNCA BORRA SESIONES SIGNAL ---
@@ -2004,26 +2590,62 @@ async function startWhatsApp() {
         if (!text) continue;
 
         const pushName = msg.pushName || (participantJid ? participantJid.split("@")[0] : remoteJid.split("@")[0]);
-        const { timeStr: nowCol } = getColombiaNowParts();
+        const { dateStr: todayDateStr, timeStr: nowCol } = getColombiaNowParts();
 
-        if (!msg.key.fromMe && pushName && remoteJid.endsWith("@s.whatsapp.net")) {
+        if (
+          !msg.key.fromMe &&
+          pushName &&
+          (remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@lid"))
+        ) {
           const cleanPush = pushName.toLowerCase().trim();
-          if (cleanPush && cleanPush !== "hermana") {
-            cloudState.learnedContacts[cleanPush] = remoteJid;
-            saveCloudState();
+          if (cleanPush && cleanPush !== "hermana" && !/^\d+$/.test(cleanPush)) {
+            if (cloudState.learnedContacts[cleanPush] !== remoteJid) {
+              cloudState.learnedContacts[cleanPush] = remoteJid;
+              saveCloudState();
+            }
           }
         }
 
-        if (!msg.key.fromMe) {
-          inboxMessages.push({ from: pushName, jid: remoteJid, body: text, time: nowCol, timestamp: Date.now() });
-          if (inboxMessages.length > 50) inboxMessages.shift();
+        const cleanText = text.trim();
+        if (cleanText.startsWith("🤖 *LILA:*") || cleanText.startsWith("⏰ *Recordatorio LILA:*")) continue;
+
+        // Si el Señor Carlos escribe manualmente en un chat, activamos la Pausa Automática de 20 min del Modo Ocupado en ese chat
+        if (msg.key.fromMe) {
+          lastOwnerManualMessageByJid.set(remoteJid, Date.now());
+          const pendingTimer = busyPendingTimers.get(remoteJid);
+          if (pendingTimer) {
+            clearTimeout(pendingTimer.timer);
+            busyPendingTimers.delete(remoteJid);
+          }
         }
 
-        const cleanText = text.trim();
-        if (cleanText.startsWith("🤖 *LILA:*")) continue;
+        // Guardar en memoria y en chat_logs de MongoDB (solo textos livianos) para que LILA recuerde qué dijo Mamá o cualquier contacto
+        if (!msg.key.fromMe && msgAgeSeconds <= 120) {
+          const logEntry = {
+            from: pushName,
+            jid: remoteJid,
+            body: cleanText,
+            dateStr: todayDateStr,
+            time: nowCol,
+            timestamp: Date.now(),
+          };
+          inboxMessages.push(logEntry);
+          if (inboxMessages.length > 150) inboxMessages.shift();
+          if (isMongoConnected && mongoDb) {
+            mongoDb
+              .collection("chat_logs")
+              .insertOne(logEntry)
+              .catch(() => {});
+          }
+        }
 
         const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
-        if (!isCommandForLila) continue;
+        if (!isCommandForLila) {
+          if (!msg.key.fromMe && msgAgeSeconds <= 90) {
+            await handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanText, isGroup });
+          }
+          continue;
+        }
 
         // 2. BLOQUEO ESTRICTO DE COMANDOS REPETIDOS O HISTÓRICOS (> 90 segundos)
         if (hasProcessedCommand(msgId)) {
@@ -2042,6 +2664,17 @@ async function startWhatsApp() {
         if (isOwnerOrSelf) {
           if (isGroup && !cloudState.lilaNotificationGroupJid) {
             syncWhatsAppGroups().catch(() => {});
+          }
+
+          // Aprendizaje contextual: si el Señor Carlos está dentro del chat 1-a-1 de su hermana y responde "Lila, Perla" o "Lila, Nelly"
+          if (!isGroup && (remoteJid.endsWith("@lid") || remoteJid.endsWith("@s.whatsapp.net"))) {
+            if (/^(saluda\s+a\s+)?perla[!.]?$/i.test(rawQuery) && !cloudState.learnedContacts["perla"]) {
+              cloudState.learnedContacts["perla"] = remoteJid;
+              saveCloudState();
+            } else if (/^(saluda\s+a\s+)?nelly[!.]?$/i.test(rawQuery) && !cloudState.learnedContacts["nelly"]) {
+              cloudState.learnedContacts["nelly"] = remoteJid;
+              saveCloudState();
+            }
           }
 
           // Interruptor de voz/texto para prender o apagar el Modo Invitado
@@ -2169,7 +2802,14 @@ async function evaluateSchedules() {
 
         let finalMessage = item.message;
         if (item.useAI && !isOwnerNotification) {
-          finalMessage = await generateSafeRoutineMessage(item.target, item.message);
+          finalMessage = await generateSafeRoutineMessage(
+            item.target,
+            item.message,
+            item.nextRunExtraNote || null,
+            item.recentGreetings || []
+          );
+        } else if (!item.useAI && !isOwnerNotification && item.nextRunExtraNote) {
+          finalMessage = `${item.message} Por cierto: ${item.nextRunExtraNote}`;
         } else if (isOwnerNotification && !/^[📅⚠️🔔⏰🤖]/.test(String(finalMessage).trim())) {
           finalMessage = `⏰ *Recordatorio LILA:* ${finalMessage}`;
         }
@@ -2180,6 +2820,16 @@ async function evaluateSchedules() {
             await sendTelegramMessage(cloudState.telegramChatId, finalMessage);
           }
           item.lastSentDate = todayStr;
+          if (item.nextRunExtraNote) {
+            item.nextRunExtraNote = null;
+          }
+          if (item.recurring && !isOwnerNotification) {
+            if (!Array.isArray(item.recentGreetings)) item.recentGreetings = [];
+            item.recentGreetings.push(finalMessage);
+            if (item.recentGreetings.length > 5) {
+              item.recentGreetings.splice(0, item.recentGreetings.length - 5);
+            }
+          }
           if (!item.recurring) item.active = false;
           changed = true;
           console.log(`[LILA] ✅ Recordatorio/Rutina enviada a ${jid}: ${finalMessage}`);
