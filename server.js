@@ -2429,9 +2429,12 @@ async function executeCloudToolCall(name, args) {
       cloudState.busyMode = {
         active: isActive,
         reason,
+        activatedAt: isActive ? Date.now() : null,
         untilTimestamp: isActive && durationMins > 0 ? Date.now() + durationMins * 60 * 1000 : null,
       };
+      // Limpiar enfriamientos y pausas manuales previas al momento de activar el Modo No Molestar
       busyAutoRepliedAt.clear();
+      lastOwnerManualMessageByJid.clear();
       for (const t of busyPendingTimers.values()) {
         if (t?.timer) clearTimeout(t.timer);
       }
@@ -2441,7 +2444,7 @@ async function executeCloudToolCall(name, args) {
         return "Modo No Molestar / Ocupado desactivado, Señor Carlos. Ya no responderé automáticamente en sus chats privados y la voz de su portátil vuelve a estar activa.";
       }
       const durText = durationMins > 0 ? ` durante ${durationMins} minutos` : "";
-      return `Modo No Molestar / Ocupado activado (${reason}${durText}). Atenderé únicamente sus chats privados (espera de 35s, prioridad Familia VIP, pausa automática si usted chatea, silencio en el portátil y cero spam en grupos).`;
+      return `Modo No Molestar / Ocupado activado (${reason}${durText}). Atenderé únicamente sus chats privados (espera de 35s, prioridad Familia VIP, pausa automática si usted chatea después de este momento, silencio en el portátil y cero spam en grupos).`;
     }
     case "get_daily_briefing": {
       return await generateMorningBriefing();
@@ -3584,6 +3587,13 @@ async function startWhatsApp() {
           }
         }
 
+        // Si un contacto externo en un chat privado escribe mientras está activo el Modo No Molestar o una Conversación Delegada
+        // (incluso si empieza su mensaje diciendo "Lila, es urgente..."), atenderlo siempre por el gestor de Modo No Molestar / Delegación
+        if (!isOwnerOrSelf && !msg.key.fromMe && !isGroup && hasDelegatedOrBusyForContact && msgAgeSeconds <= 90) {
+          await handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanText, isGroup });
+          continue;
+        }
+
         const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
         if (!isCommandForLila) {
           if (!msg.key.fromMe && msgAgeSeconds <= 90) {
@@ -3623,16 +3633,37 @@ async function startWhatsApp() {
             }
           }
 
-          // Interruptor directo de Modo No Molestar / Modo Ocupado (garantiza activación/desactivación inmediata)
+          // Interruptor directo de Modo No Molestar / Modo Ocupado (soporta motivo y duración en minutos u horas)
           if (/^(apaga|desactiva|quita|termina|cancela)\s+(el\s+)?(modo\s+)?(no\s+molestar|ocupado)\b/i.test(rawQuery)) {
             const resText = await executeCloudToolCall("set_busy_mode", { active: false });
             await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${resText}` }, { quoted: msg });
             continue;
           }
-          if (/^(activa|prende|pon|habilita|enciende)\s+(el\s+)?(modo\s+)?(no\s+molestar|ocupado)$/i.test(rawQuery)) {
+          const busyOnMatch = rawQuery.match(
+            /^(?:activa|prende|pon|habilita|enciende)\s+(?:el\s+)?(?:modo\s+)?(no\s+molestar|ocupado)(?:\s+(.*))?$/i
+          );
+          if (busyOnMatch) {
+            const modeKind = busyOnMatch[1].toLowerCase();
+            const tail = (busyOnMatch[2] || "").trim();
+            let durationMinutes = 0;
+            const minsMatch = tail.match(/por\s+(\d+)\s*(?:minuto|minutos|min|mins)\b/i);
+            const hoursMatch = tail.match(/por\s+(\d+(?:[.,]\d+)?)\s*(?:hora|horas|h|hr|hrs)\b/i);
+            if (minsMatch) durationMinutes = parseInt(minsMatch[1], 10);
+            else if (hoursMatch) durationMinutes = Math.round(parseFloat(hoursMatch[1].replace(",", ".")) * 60);
+
+            let reason = modeKind.includes("no") ? "en modo no molestar" : "ocupado en este momento";
+            const reasonClean = tail
+              .replace(/por\s+\d+(?:[.,]\d+)?\s*(?:minuto|minutos|min|mins|hora|horas|h|hr|hrs)\b/i, "")
+              .replace(/^(?:porque|ya\s+que|que|pues)\s+/i, "")
+              .replace(/^(?:estoy|voy\s+a\s+estar|estar[eé])\s+/i, "")
+              .trim();
+            if (reasonClean.length >= 3) {
+              reason = reasonClean;
+            }
             const resText = await executeCloudToolCall("set_busy_mode", {
               active: true,
-              reason: /no\s+molestar/i.test(rawQuery) ? "en modo no molestar" : "ocupado en este momento",
+              reason,
+              durationMinutes,
             });
             await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${resText}` }, { quoted: msg });
             continue;
