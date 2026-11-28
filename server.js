@@ -6,6 +6,7 @@ const {
   DisconnectReason,
   fetchLatestBaileysVersion,
   generateMessageIDV2,
+  downloadMediaMessage,
 } = require("@whiskeysockets/baileys");
 const QRCode = require("qrcode");
 const pino = require("pino");
@@ -440,23 +441,81 @@ async function syncAllAuthToMongo() {
   }
 }
 
-// --- REGISTRO DE FINANZAS Y GASTOS (Nequi / Bancolombia) ---
-async function recordFinanceTransaction({ from, to, amount, description, rawText }) {
-  if (!isMongoConnected || !mongoDb) return;
-  try {
-    const col = mongoDb.collection("finances");
-    await col.insertOne({
-      from,
-      to,
-      amount,
-      description,
-      rawText,
-      timestamp: new Date().toISOString(),
-    });
-    console.log(`[LILA] 💰 Transacción registrada en MongoDB: ${amount} a ${to}`);
-  } catch (e) {
-    console.error("Error guardando finanzas en MongoDB:", e.message);
+// --- REGISTRO DE FINANZAS Y GASTOS (Nequi / Bancolombia / Efectivo) ---
+function parseColombianAmount(rawAmount) {
+  if (typeof rawAmount === "number" && !Number.isNaN(rawAmount)) return Math.round(rawAmount);
+  const str = String(rawAmount || "").trim().toLowerCase();
+  if (!str) return 0;
+  const milMatch = str.match(/(\d+(?:[.,]\d+)?)\s*(mil|k)\b/i);
+  if (milMatch) {
+    return Math.round(parseFloat(milMatch[1].replace(",", ".")) * 1000);
   }
+  const cleaned = str.replace(/,\d{1,2}$/, "").replace(/\D/g, "");
+  return cleaned ? parseInt(cleaned, 10) : 0;
+}
+
+function formatColombianPesos(num) {
+  const n = Number(num) || 0;
+  return "$" + n.toLocaleString("es-CO");
+}
+
+async function recordFinanceTransaction({
+  from = "Señor Carlos",
+  to = "General",
+  amount = 0,
+  numericAmount = 0,
+  type = "gasto",
+  category = "general",
+  description = "",
+  rawText = "",
+  source = "whatsapp",
+  emailId = null,
+}) {
+  const parsedNum = numericAmount > 0 ? Math.round(numericAmount) : parseColombianAmount(amount);
+  const formattedAmount = parsedNum > 0 ? formatColombianPesos(parsedNum) : String(amount || "$0");
+  const { dateStr, timeStr } = getColombiaNowParts();
+  const normalizedType = /^(ingreso|recibido|abono|entrada)/i.test(String(type || "")) ? "ingreso" : "gasto";
+
+  const entry = {
+    from: String(from || "Señor Carlos").trim(),
+    to: String(to || "General").trim(),
+    amount: formattedAmount,
+    numericAmount: parsedNum,
+    type: normalizedType,
+    category: String(category || "general").toLowerCase().trim(),
+    description: String(description || "").trim(),
+    rawText: String(rawText || "").trim(),
+    source,
+    emailId,
+    dateStr,
+    timeStr,
+    timestamp: new Date().toISOString(),
+  };
+
+  if (!Array.isArray(cloudState.recentFinances)) cloudState.recentFinances = [];
+  if (emailId && cloudState.recentFinances.some((f) => f.emailId === emailId)) {
+    return null;
+  }
+  cloudState.recentFinances.push(entry);
+  if (cloudState.recentFinances.length > 60) {
+    cloudState.recentFinances.splice(0, cloudState.recentFinances.length - 60);
+  }
+  saveCloudState();
+
+  if (isMongoConnected && mongoDb) {
+    try {
+      const col = mongoDb.collection("finances");
+      if (emailId) {
+        const exists = await col.findOne({ emailId });
+        if (exists) return exists;
+      }
+      await col.insertOne(entry);
+      console.log(`[LILA] 💰 Transacción registrada en MongoDB (${normalizedType}): ${formattedAmount} -> ${entry.to}`);
+    } catch (e) {
+      console.error("Error guardando finanzas en MongoDB:", e.message);
+    }
+  }
+  return entry;
 }
 
 // --- CACHÉ SIGNAL Y REINTENTOS ROBUSTOS (Erradica "Esperando mensaje...") ---
@@ -478,6 +537,16 @@ function createSimpleCache(maxEntries = 3000) {
 
 const msgRetryCounterCache = createSimpleCache(3000);
 const sentMessagesCache = new Map();
+const lilaGeneratedMsgIds = new Set();
+
+function markLilaOwnMessageId(id) {
+  if (!id) return;
+  lilaGeneratedMsgIds.add(id);
+  if (lilaGeneratedMsgIds.size > 1000) {
+    const oldest = lilaGeneratedMsgIds.values().next().value;
+    lilaGeneratedMsgIds.delete(oldest);
+  }
+}
 
 function rememberMessage(msgObj, persistToMongo = false) {
   if (!msgObj?.key?.id) return;
@@ -508,10 +577,10 @@ function rememberMessage(msgObj, persistToMongo = false) {
   }
 }
 
-// Normaliza el JID respetando grupos (@g.us), identidades vinculadas (@lid) y el canal LID oficial de Mamá
-function normalizeTargetJid(jid) {
-  if (!jid) return null;
-  const raw = String(jid).trim();
+// Distingue con precisión entre grupos (@g.us), identidades vinculadas Signal (@lid) y teléfonos (@s.whatsapp.net)
+function sanitizeAndFormatJid(rawInput) {
+  if (!rawInput) return null;
+  const raw = String(rawInput).trim();
   const momLidPrefix = MOM_LID_JID ? MOM_LID_JID.split("@")[0] : "";
   if (
     (MOM_PHONE_DIGITS && raw.includes(MOM_PHONE_DIGITS)) ||
@@ -519,15 +588,52 @@ function normalizeTargetJid(jid) {
   ) {
     return MOM_LID_JID;
   }
-  if (raw.endsWith("@g.us") || raw.endsWith("@lid")) return raw;
+
+  const digits = raw.replace(/@.*$/, "").replace(/:\d+$/, "").replace(/\D/g, "");
+  if (!digits) return raw.includes("@") ? raw : null;
+
+  // 1. Grupos de WhatsApp siempre inician con 120363 y tienen 17-19 dígitos
+  if (raw.endsWith("@g.us") || (digits.startsWith("120363") && digits.length >= 16)) {
+    return `${digits}@g.us`;
+  }
+
+  // 2. Si ya viene etiquetado explícitamente como @lid, respetarlo siempre
+  if (raw.endsWith("@lid")) {
+    return `${digits}@lid`;
+  }
+
+  // 3. Teléfono del creador (Señor Carlos)
   const ownerNum = OWNER_PHONE || connectedNumber;
-  if (ownerNum && raw.includes(ownerNum)) {
+  if (ownerNum && digits === ownerNum) {
     return `${ownerNum}@s.whatsapp.net`;
   }
-  if (/^\d{10,15}$/.test(raw)) {
-    return `${raw}@s.whatsapp.net`;
+
+  // 4. Número celular colombiano de 10 dígitos (3XXXXXXXXX) o 12 dígitos (573XXXXXXXXX)
+  if (digits.length === 10 && digits.startsWith("3")) {
+    return `57${digits}@s.whatsapp.net`;
+  }
+  if (digits.length === 12 && digits.startsWith("573")) {
+    return `${digits}@s.whatsapp.net`;
+  }
+
+  // 5. Identificadores Signal Linked ID (@lid): tienen entre 13 y 15 dígitos (o 12 que no son 573...)
+  // que anteriormente se corrompían al quitárseles el sufijo @lid durante el sync con LILA Desk
+  if (digits.length >= 13 && digits.length <= 15 && !digits.startsWith("573") && !digits.startsWith("120363")) {
+    return `${digits}@lid`;
+  }
+
+  if (raw.endsWith("@s.whatsapp.net")) {
+    return `${digits}@s.whatsapp.net`;
+  }
+  if (/^\d{10,15}$/.test(digits)) {
+    return `${digits}@s.whatsapp.net`;
   }
   return raw;
+}
+
+// Normaliza el JID respetando grupos (@g.us), identidades vinculadas (@lid) y el canal LID oficial de Mamá
+function normalizeTargetJid(jid) {
+  return sanitizeAndFormatJid(jid);
 }
 
 async function safeSendMessage(jid, content, options = {}) {
@@ -537,20 +643,26 @@ async function safeSendMessage(jid, content, options = {}) {
 
   // Pre-generar y pre-guardar el mensaje en sentMessagesCache ANTES de enviarlo por red (elimina la condición de carrera de 8ms en reintentos Signal)
   const msgId = sendOpts.messageId || (typeof generateMessageIDV2 === "function" ? generateMessageIDV2(sock.user?.id) : undefined);
-  if (msgId && content?.text) {
-    const preProto = {
-      extendedTextMessage: { text: String(content.text) },
-      conversation: String(content.text),
-    };
-    sentMessagesCache.set(msgId, preProto);
-    if (target) {
-      sentMessagesCache.set(`${target}:${msgId}`, preProto);
+  if (msgId) {
+    markLilaOwnMessageId(msgId);
+    if (content?.text) {
+      const preProto = {
+        extendedTextMessage: { text: String(content.text) },
+        conversation: String(content.text),
+      };
+      sentMessagesCache.set(msgId, preProto);
+      if (target) {
+        sentMessagesCache.set(`${target}:${msgId}`, preProto);
+      }
     }
   }
 
   const finalOptions = msgId ? { ...sendOpts, messageId: msgId } : sendOpts;
   const sent = await sock.sendMessage(target, content, finalOptions);
-  if (sent) rememberMessage(sent, true);
+  if (sent) {
+    if (sent.key?.id) markLilaOwnMessageId(sent.key.id);
+    rememberMessage(sent, true);
+  }
   scheduleSyncAuthToMongo(250);
   return sent;
 }
@@ -613,6 +725,81 @@ function normalizeSearchKey(str) {
     .replace(/[^a-z0-9]/g, "");
 }
 
+function stripEmojisAndSymbols(str) {
+  return String(str || "")
+    .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/gu, " ")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+const PROTECTED_CONTACT_KEYS = new Set(["paula", "pechy", "mamá", "mama", "lila", "carlos", "señor carlos", "hermana"]);
+
+function learnContactEntry(rawName, rawJid, persist = false) {
+  if (!rawName || !rawJid) return false;
+  const formattedJid = sanitizeAndFormatJid(rawJid);
+  if (!formattedJid || formattedJid === "status@broadcast") return false;
+
+  const cleanOriginal = String(rawName).toLowerCase().trim();
+  if (!cleanOriginal || cleanOriginal === "hermana" || /^\d+$/.test(cleanOriginal)) return false;
+
+  let changed = false;
+  if (!PROTECTED_CONTACT_KEYS.has(cleanOriginal) || !cloudState.learnedContacts[cleanOriginal]) {
+    if (cloudState.learnedContacts[cleanOriginal] !== formattedJid) {
+      cloudState.learnedContacts[cleanOriginal] = formattedJid;
+      changed = true;
+    }
+  }
+
+  // También indexar el nombre limpio sin emojis ni signos (ej. "eimar💥" -> "eimar", "jair salcedo - 👽🤖" -> "jair salcedo")
+  if (!formattedJid.endsWith("@g.us")) {
+    const cleanAlpha = stripEmojisAndSymbols(cleanOriginal);
+    if (cleanAlpha && cleanAlpha.length >= 3 && !PROTECTED_CONTACT_KEYS.has(cleanAlpha)) {
+      if (cloudState.learnedContacts[cleanAlpha] !== formattedJid) {
+        cloudState.learnedContacts[cleanAlpha] = formattedJid;
+        changed = true;
+      }
+      // Si tiene nombre y apellido ("jair salcedo"), registrar también el primer nombre ("jair") si no está ocupado por otro contacto
+      const firstWord = cleanAlpha.split(" ")[0];
+      if (
+        firstWord &&
+        firstWord.length >= 3 &&
+        firstWord !== cleanAlpha &&
+        !PROTECTED_CONTACT_KEYS.has(firstWord) &&
+        !cloudState.learnedContacts[firstWord]
+      ) {
+        cloudState.learnedContacts[firstWord] = formattedJid;
+        changed = true;
+      }
+    }
+  }
+
+  if (changed && persist) {
+    saveCloudState();
+  }
+  return changed;
+}
+
+function ingestBaileysContactsList(contactsList) {
+  if (!Array.isArray(contactsList) || contactsList.length === 0) return;
+  let anyChanged = false;
+  for (const c of contactsList) {
+    if (!c) continue;
+    const jid = c.id || c.jid;
+    const lid = c.lid;
+    // Priorizar el nombre agendado en el teléfono (c.name), luego verifiedName y luego notify (pushName)
+    const names = [c.name, c.verifiedName, c.notify].filter((n) => n && typeof n === "string" && n.trim().length >= 2);
+    for (const name of names) {
+      if (jid && learnContactEntry(name, jid, false)) anyChanged = true;
+      if (lid && !jid && learnContactEntry(name, lid, false)) anyChanged = true;
+    }
+  }
+  if (anyChanged) {
+    saveCloudState();
+  }
+}
+
 async function syncWhatsAppGroups() {
   if (!sock || connectionStatus !== "connected") return;
   try {
@@ -631,6 +818,16 @@ async function syncWhatsAppGroups() {
           cloudState.lilaNotificationGroupJid = jid;
           changed = true;
           console.log(`[LILA] 🔔 Grupo oficial de notificaciones 'LILA' detectado: ${jid}`);
+        }
+      }
+      // Si el metadata del grupo trae participantes con nombre/notify, aprenderlos también
+      if (Array.isArray(meta?.participants)) {
+        for (const p of meta.participants) {
+          const pName = p?.name || p?.notify || p?.verifiedName;
+          const pJid = p?.id || p?.jid;
+          if (pName && pJid && learnContactEntry(pName, pJid, false)) {
+            changed = true;
+          }
         }
       }
     }
@@ -756,34 +953,55 @@ function resolveContactTarget(target, _depth = 0) {
   }
 
   if (raw.includes("@s.whatsapp.net") || raw.includes("@g.us") || raw.includes("@lid")) {
-    return { ok: true, jid: raw, canonicalName: raw.split("@")[0], relationship: "general" };
+    const cleanJ = sanitizeAndFormatJid(raw);
+    return { ok: true, jid: cleanJ, canonicalName: raw.split("@")[0], relationship: "general" };
   }
 
   if (cloudState.learnedContacts[lower]) {
+    const cleanJ = sanitizeAndFormatJid(cloudState.learnedContacts[lower]);
     return {
       ok: true,
-      jid: cloudState.learnedContacts[lower],
+      jid: cleanJ,
       canonicalName: raw,
       relationship: ["nelly", "perla"].includes(lower) ? "sister" : "general",
     };
   }
 
-  // Búsqueda exacta sin espacios ni tildes (ej. "cuarto game r" === "Cuarto gamer")
-  for (const [name, jid] of Object.entries(cloudState.learnedContacts)) {
+  // Búsqueda exacta sin espacios, tildes ni emojis (ej. "eimar" === "eimar💥", "cuarto game r" === "Cuarto gamer")
+  for (const [name, rawJid] of Object.entries(cloudState.learnedContacts)) {
     if (normTarget && normalizeSearchKey(name) === normTarget) {
+      const jid = sanitizeAndFormatJid(rawJid);
       return { ok: true, jid, canonicalName: name, relationship: "general" };
     }
   }
 
+  // Búsqueda por primer nombre o palabra completa sin emojis (ej. "Jair" -> "jair salcedo - 👽🤖", "Gleider" -> "gleider ramírez")
+  const wordMatches = [];
+  for (const [name, rawJid] of Object.entries(cloudState.learnedContacts)) {
+    const cleanWords = stripEmojisAndSymbols(name)
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .split(" ")
+      .filter(Boolean);
+    if (normTarget.length >= 3 && cleanWords.includes(normTarget)) {
+      wordMatches.push({ name, jid: sanitizeAndFormatJid(rawJid) });
+    }
+  }
+  const uniqueWordJids = [...new Set(wordMatches.map((m) => m.jid))];
+  if (uniqueWordJids.length === 1) {
+    return { ok: true, jid: uniqueWordJids[0], canonicalName: wordMatches[0].name, relationship: "general" };
+  }
+
   const matches = [];
-  for (const [name, jid] of Object.entries(cloudState.learnedContacts)) {
+  for (const [name, rawJid] of Object.entries(cloudState.learnedContacts)) {
     const normName = normalizeSearchKey(name);
+    if (!normName || normName.length < 2) continue;
     if (
       name.includes(lower) ||
-      lower.includes(name) ||
+      (name.length >= 3 && lower.includes(name)) ||
       (normTarget.length >= 3 && (normName.includes(normTarget) || normTarget.includes(normName)))
     ) {
-      matches.push({ name, jid });
+      matches.push({ name, jid: sanitizeAndFormatJid(rawJid) });
     }
   }
   const uniqueJids = [...new Set(matches.map((m) => m.jid))];
@@ -791,7 +1009,14 @@ function resolveContactTarget(target, _depth = 0) {
     return { ok: true, jid: uniqueJids[0], canonicalName: matches[0].name, relationship: "general" };
   }
   if (uniqueJids.length > 1) {
-    const namesList = matches.map((m) => `${m.name} (${m.jid.endsWith("@g.us") ? "Grupo" : "+" + m.jid.split("@")[0]})`).join(", ");
+    // Agrupar por JID único para no mostrar duplicados de alias (ej. "eimar" y "eimar💥" con el mismo JID)
+    const byJid = new Map();
+    for (const m of matches) {
+      if (!byJid.has(m.jid)) byJid.set(m.jid, m.name);
+    }
+    const namesList = [...byJid.entries()]
+      .map(([j, n]) => `${n} (${j.endsWith("@g.us") ? "Grupo" : j.endsWith("@lid") ? "Chat privado" : "+" + j.split("@")[0]})`)
+      .join(", ");
     return {
       ok: false,
       ambiguous: true,
@@ -800,14 +1025,14 @@ function resolveContactTarget(target, _depth = 0) {
   }
 
   let digits = raw.replace(/\D/g, "");
-  if (digits.length === 10 && digits.startsWith("3")) digits = "57" + digits;
   if (digits.length >= 10) {
-    return { ok: true, jid: `${digits}@s.whatsapp.net`, canonicalName: `+${digits}`, relationship: "general" };
+    const formatted = sanitizeAndFormatJid(digits);
+    return { ok: true, jid: formatted, canonicalName: `+${digits}`, relationship: "general" };
   }
 
   return {
     ok: false,
-    error: `Señor Carlos, aún no tengo registrado el chat o contacto '${raw}' en mi memoria. Si es una persona, ¿me indica su número para guardarlo?`,
+    error: `Señor Carlos, revisé toda su agenda sincronizada de WhatsApp y aún no aparece ningún contacto ni grupo llamado '${raw}'. ¿Me indica su número o cómo lo tiene guardado para registrarlo?`,
   };
 }
 
@@ -1106,20 +1331,9 @@ async function checkGmailLive(query = "is:unread newer_than:2d", targetAccount =
 }
 
 // --- AGENDA UNIFICADA Y RECORDATORIOS ESCALONADOS ---
-function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", notes = "" }) {
+function scheduleEscalatedRemindersForTask(task) {
   const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
-  const eventId = "ev_" + Date.now().toString(36);
-  const task = {
-    id: eventId,
-    title: String(title).trim(),
-    dueDate: String(dueDate).trim(),
-    dueTime: String(dueTime || "07:00").trim(),
-    notes: String(notes || "").trim(),
-    createdAt: new Date().toISOString(),
-    completed: false,
-  };
-  cloudState.agendaTasks.push(task);
-
+  const eventId = task.id;
   const ownerTarget = "lila_group";
   const createdReminders = [];
 
@@ -1189,9 +1403,145 @@ function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", not
     createdReminders.push(`el mismo día (${task.dueDate} a las ${morningTime})`);
   }
 
+  return createdReminders;
+}
+
+function createAgendaEventWithReminders({ title, dueDate, dueTime = "07:00", notes = "" }) {
+  const eventId = "ev_" + Date.now().toString(36);
+  const task = {
+    id: eventId,
+    title: String(title).trim(),
+    dueDate: String(dueDate).trim(),
+    dueTime: String(dueTime || "07:00").trim(),
+    notes: String(notes || "").trim(),
+    createdAt: new Date().toISOString(),
+    completed: false,
+  };
+  cloudState.agendaTasks.push(task);
+
+  const createdReminders = scheduleEscalatedRemindersForTask(task);
   saveCloudState();
   saveSchedules();
   return { task, createdReminders };
+}
+
+function deactivateTaskChildReminders(eventId) {
+  if (!eventId) return 0;
+  let deactivated = 0;
+  for (const s of schedules) {
+    if (s.active && (s.parentEventId === eventId || String(s.id || "").startsWith(`${eventId}_`))) {
+      s.active = false;
+      deactivated++;
+    }
+  }
+  return deactivated;
+}
+
+function updateOrCompleteAgendaTask({
+  taskQuery = "",
+  action = "complete",
+  newDueDate = null,
+  newDueTime = null,
+  newTitle = null,
+  newNotes = null,
+}) {
+  const rawQ = String(taskQuery || "").trim();
+  const normQ = normalizeSearchKey(rawQ);
+  const tasks = Array.isArray(cloudState.agendaTasks) ? cloudState.agendaTasks : [];
+
+  // Buscar primero entre tareas pendientes no completadas
+  let matchedTask = tasks.find(
+    (t) =>
+      !t.completed &&
+      (t.id === rawQ ||
+        (normQ &&
+          (normalizeSearchKey(t.title).includes(normQ) ||
+            normQ.includes(normalizeSearchKey(t.title)) ||
+            normalizeSearchKey(t.notes || "").includes(normQ))))
+  );
+
+  // Si solo hay 1 tarea pendiente y el usuario dijo "esa tarea" / "la tarea" / vacío
+  const pendingAll = tasks.filter((t) => !t.completed);
+  if (!matchedTask && pendingAll.length === 1 && (!normQ || /^(tarea|compromiso|entrega|examen|parcial|exposicion)$/.test(normQ))) {
+    matchedTask = pendingAll[0];
+  }
+
+  // Fallback a cualquier tarea aunque ya esté completada (por si la quiere reprogramar o borrar)
+  if (!matchedTask && normQ) {
+    matchedTask = tasks.find(
+      (t) =>
+        t.id === rawQ ||
+        normalizeSearchKey(t.title).includes(normQ) ||
+        normQ.includes(normalizeSearchKey(t.title))
+    );
+  }
+
+  if (!matchedTask) {
+    return {
+      ok: false,
+      error: rawQ
+        ? `Señor Carlos, no encontré ninguna tarea en su agenda que coincida con '${rawQ}'.`
+        : "Señor Carlos, por favor indíqueme el nombre de la tarea o compromiso que desea actualizar.",
+    };
+  }
+
+  const cleanAction = String(action || "complete").toLowerCase().trim();
+
+  if (cleanAction === "delete" || cleanAction === "eliminar" || cleanAction === "borrar") {
+    const removedTitle = matchedTask.title;
+    const removedReminders = deactivateTaskChildReminders(matchedTask.id);
+    cloudState.agendaTasks = tasks.filter((t) => t.id !== matchedTask.id);
+    saveCloudState();
+    saveSchedules();
+    return {
+      ok: true,
+      action: "delete",
+      task: matchedTask,
+      message: `Compromiso '${removedTitle}' eliminado de su agenda (${removedReminders} recordatorio(s) automático(s) cancelado(s)).`,
+    };
+  }
+
+  if (cleanAction === "reschedule" || cleanAction === "reprogramar" || cleanAction === "update" || newDueDate) {
+    if (newTitle && String(newTitle).trim()) matchedTask.title = String(newTitle).trim();
+    if (newDueDate && String(newDueDate).trim()) matchedTask.dueDate = String(newDueDate).trim();
+    if (newDueTime && String(newDueTime).trim()) matchedTask.dueTime = String(newDueTime).trim();
+    if (newNotes !== null && newNotes !== undefined) matchedTask.notes = String(newNotes).trim();
+    matchedTask.completed = false;
+    matchedTask.updatedAt = new Date().toISOString();
+
+    deactivateTaskChildReminders(matchedTask.id);
+    // Eliminar entradas viejas inactivas con el mismo ID para que las nuevas se inserten limpias
+    const childIds = new Set([`${matchedTask.id}_3d`, `${matchedTask.id}_1d`, `${matchedTask.id}_0d`]);
+    for (let i = schedules.length - 1; i >= 0; i--) {
+      if (schedules[i].parentEventId === matchedTask.id || childIds.has(schedules[i].id)) {
+        schedules.splice(i, 1);
+      }
+    }
+    const createdReminders = scheduleEscalatedRemindersForTask(matchedTask);
+    saveCloudState();
+    saveSchedules();
+    const remsText = createdReminders.length > 0 ? createdReminders.join(", ") : "notificación el mismo día";
+    return {
+      ok: true,
+      action: "reschedule",
+      task: matchedTask,
+      createdReminders,
+      message: `Compromiso '${matchedTask.title}' reprogramado para el ${matchedTask.dueDate} a las ${matchedTask.dueTime}. Nuevos recordatorios activos: ${remsText}.`,
+    };
+  }
+
+  // Acción por defecto: complete (marcar como completada)
+  matchedTask.completed = true;
+  matchedTask.completedAt = new Date().toISOString();
+  const cancelledRems = deactivateTaskChildReminders(matchedTask.id);
+  saveCloudState();
+  saveSchedules();
+  return {
+    ok: true,
+    action: "complete",
+    task: matchedTask,
+    message: `¡Excelente, Señor Carlos! He marcado '${matchedTask.title}' como completado en su agenda y desactivé sus ${cancelledRems} recordatorio(s) pendiente(s).`,
+  };
 }
 
 // Consulta de tareas pendientes para responder a "¿tengo algo pendiente?"
@@ -1280,6 +1630,37 @@ const CLOUD_TOOLS_DECLARATIONS = [
     },
   },
   {
+    name: "update_or_complete_agenda_task",
+    description:
+      "Marca como completada ('complete'), reprograma ('reschedule') o elimina ('delete') una tarea, entrega, exposición o parcial de la agenda del Señor Carlos, cancelando o reprogramando automáticamente sus 3 recordatorios.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        taskQuery: {
+          type: "STRING",
+          description: "Nombre o palabra clave de la tarea (ej. 'Física', 'Cálculo', 'Exposición').",
+        },
+        action: {
+          type: "STRING",
+          description: "'complete' (ya la terminó/entregó), 'reschedule' (cambió de fecha/hora) o 'delete' (borrar de la agenda).",
+        },
+        newDueDate: {
+          type: "STRING",
+          description: "Nueva fecha en formato 'YYYY-MM-DD' (solo si action es 'reschedule').",
+        },
+        newDueTime: {
+          type: "STRING",
+          description: "Nueva hora en formato 'HH:MM' (opcional para 'reschedule').",
+        },
+        newNotes: {
+          type: "STRING",
+          description: "Notas actualizadas opcionales.",
+        },
+      },
+      required: ["taskQuery", "action"],
+    },
+  },
+  {
     name: "get_scheduled_routines",
     description: "Consulta las rutinas y mensajes programados activos en la memoria de LILA.",
     parameters: {
@@ -1349,6 +1730,17 @@ const CLOUD_TOOLS_DECLARATIONS = [
     },
   },
   {
+    name: "list_or_search_contacts",
+    description:
+      "Busca un contacto o grupo en la agenda sincronizada de WhatsApp de LILA, o lista todos los contactos y grupos que LILA ya conoce.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        query: { type: "STRING", description: "Nombre opcional a buscar (o vacío para listar todos los contactos y grupos conocidos)." },
+      },
+    },
+  },
+  {
     name: "get_chat_history",
     description:
       "Consulta los mensajes recibidos recientemente en WhatsApp de un contacto (ej. mamá, Perla, Eimar) o de un grupo para recordar qué dijeron o hacer un resumen.",
@@ -1377,15 +1769,39 @@ const CLOUD_TOOLS_DECLARATIONS = [
   {
     name: "set_busy_mode",
     description:
-      "Activa o desactiva el Modo Ocupado / Secretario Inteligente de LILA (con regla de 35s, prioridad Familia VIP, cero spam en grupos y detector de urgencias).",
+      "Activa o desactiva el Modo No Molestar / Modo Ocupado / Secretario Inteligente de LILA (con regla de 35s, prioridad Familia VIP, silencio de voz en el portátil, cero spam en grupos y detector de urgencias).",
     parameters: {
       type: "OBJECT",
       properties: {
-        active: { type: "BOOLEAN", description: "true para activar modo ocupado; false para desactivarlo." },
-        reason: { type: "STRING", description: "Motivo (ej. 'en el gimnasio', 'en clase de Física', 'estudiando')." },
+        active: { type: "BOOLEAN", description: "true para activar el Modo No Molestar / Modo Ocupado; false para desactivarlo." },
+        reason: { type: "STRING", description: "Motivo (ej. 'en modo no molestar', 'durmiendo', 'en el gimnasio', 'en clase de Física', 'estudiando')." },
         durationMinutes: { type: "NUMBER", description: "Duración opcional en minutos (ej. 120 para 2 horas) tras la cual se apaga solo." },
       },
       required: ["active"],
+    },
+  },
+  {
+    name: "get_daily_briefing",
+    description:
+      "Genera y entrega el Informe Ejecutivo Matutino / Resumen del Día para el Señor Carlos (clima en Riohacha y Hatonuevo, tareas pendientes de la agenda, correos importantes y estado de rutinas).",
+    parameters: {
+      type: "OBJECT",
+      properties: {},
+    },
+  },
+  {
+    name: "execute_on_laptop",
+    description:
+      "Envía una orden remota desde WhatsApp hacia LILA Desk (el portátil Windows del Señor Carlos) para controlar música, consultar batería/CPU, crear documentos Word/Excel/PDF o ejecutar acciones locales en su PC.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        command: {
+          type: "STRING",
+          description: "Instrucción exacta que LILA Desk debe ejecutar en el portátil (ej. 'pausa la música', 'dime en cuánto está la batería', 'crea un documento Word llamado...').",
+        },
+      },
+      required: ["command"],
     },
   },
   {
@@ -1413,11 +1829,47 @@ const CLOUD_TOOLS_DECLARATIONS = [
     },
   },
   {
-    name: "get_finances_summary",
-    description: "Consulta el historial de movimientos financieros, transferencias o pagos de Nequi guardados en la base de datos.",
+    name: "record_finance_transaction",
+    description:
+      "Registra en MongoDB Atlas un gasto, pago, transferencia de Nequi/Bancolombia o ingreso financiero del Señor Carlos (ej. 'anota que gasté 20.000 en almuerzo', 'le transferí 50 mil a mi mamá').",
     parameters: {
       type: "OBJECT",
-      properties: {},
+      properties: {
+        amount: {
+          type: "STRING",
+          description: "Monto en pesos colombianos (ej. '20000', '$20.000', '50 mil').",
+        },
+        description: {
+          type: "STRING",
+          description: "Concepto o motivo del movimiento (ej. 'Almuerzo', 'Transporte', 'Transferencia a Pechy').",
+        },
+        to: {
+          type: "STRING",
+          description: "Destinatario o lugar opcional (ej. 'Pechy', 'Restaurante', 'Uniguajira').",
+        },
+        type: {
+          type: "STRING",
+          description: "'gasto' (por defecto) o 'ingreso'.",
+        },
+        category: {
+          type: "STRING",
+          description: "Categoría opcional: 'alimentacion', 'transporte', 'familia', 'universidad', 'otros'.",
+        },
+      },
+      required: ["amount", "description"],
+    },
+  },
+  {
+    name: "get_finances_summary",
+    description: "Consulta el historial y balance totalizado de movimientos financieros, gastos, transferencias o pagos de Nequi guardados en la base de datos.",
+    parameters: {
+      type: "OBJECT",
+      properties: {
+        period: {
+          type: "STRING",
+          description: "Período opcional a consultar: 'today' (hoy), 'week' (últimos 7 días), 'month' (este mes) o 'all' (todos, por defecto).",
+        },
+      },
     },
   },
   {
@@ -1459,7 +1911,27 @@ async function runSelfDiagnosticAndRepair(applyFix = false) {
     }
   }
 
-  // 2. Revisar rutinas con target antiguo o inválido
+  // 1.5 Reparar contactos aprendidos cuyos canales @lid o @g.us fueron convertidos por error a @s.whatsapp.net e indexar nombres sin emojis
+  let repairedContactsCount = 0;
+  for (const [cKey, cVal] of Object.entries({ ...(cloudState.learnedContacts || {}) })) {
+    const fixedJid = sanitizeAndFormatJid(cVal);
+    if (fixedJid && fixedJid !== cVal) {
+      issues.push(`El contacto/grupo '${cKey}' tenía formato '${cVal}' en lugar de '${fixedJid}'.`);
+      if (applyFix) {
+        cloudState.learnedContacts[cKey] = fixedJid;
+        repairedContactsCount++;
+      }
+    }
+    if (applyFix && fixedJid) {
+      if (learnContactEntry(cKey, fixedJid, false)) {
+        repairedContactsCount++;
+      }
+    }
+  }
+  if (applyFix && repairedContactsCount > 0) {
+    await saveCloudState();
+    fixesApplied.push(`Saneados e indexados sin emojis ${repairedContactsCount} canales de contactos (@lid / @g.us).`);
+  }
   for (const s of schedules) {
     if (!s.active) continue;
     if (String(s.target).includes(MOM_PHONE_DIGITS) && s.target !== MOM_LID_JID) {
@@ -1549,17 +2021,72 @@ async function executeCloudToolCall(name, args) {
   switch (name) {
     case "diagnose_and_repair_system":
       return await runSelfDiagnosticAndRepair(Boolean(args?.applyFix));
+    case "record_finance_transaction": {
+      const entry = await recordFinanceTransaction({
+        from: "Señor Carlos",
+        to: args?.to || args?.description || "General",
+        amount: args?.amount,
+        type: args?.type || "gasto",
+        category: args?.category || "general",
+        description: args?.description || "",
+        rawText: `${args?.type || "gasto"}: ${args?.amount} - ${args?.description || ""}`,
+        source: "whatsapp",
+      });
+      if (!entry) return "No se pudo registrar el movimiento financiero.";
+      return `Movimiento financiero registrado en MongoDB Atlas: *${entry.type.toUpperCase()}* de *${entry.amount}* (${entry.description || entry.to}) el ${entry.dateStr}.`;
+    }
     case "get_finances_summary": {
-      if (!isMongoConnected || !mongoDb) return "Base de datos de finanzas en MongoDB no disponible en este momento.";
-      try {
-        const col = mongoDb.collection("finances");
-        const docs = await col.find({}).sort({ timestamp: -1 }).limit(8).toArray();
-        if (!docs || docs.length === 0) return "No hay registros de transferencias o pagos guardados recientemente.";
-        const lines = docs.map((d) => `- ${d.amount} a ${d.to} (${d.description || ""}) [${(d.timestamp || "").split("T")[0]}]`);
-        return `Últimos movimientos registrados en finanzas:\n` + lines.join("\n");
-      } catch (err) {
-        return `Error consultando finanzas: ${err.message}`;
+      const period = String(args?.period || "all").toLowerCase().trim();
+      const { dateStr: todayStr } = getColombiaNowParts();
+      let minDateStr = null;
+      if (period === "today" || period === "hoy") {
+        minDateStr = todayStr;
+      } else if (period === "week" || period === "semana") {
+        minDateStr = addDaysToDateStr(todayStr, -7);
+      } else if (period === "month" || period === "mes") {
+        minDateStr = todayStr.slice(0, 7) + "-01";
       }
+
+      let docs = [];
+      if (isMongoConnected && mongoDb) {
+        try {
+          const col = mongoDb.collection("finances");
+          const query = minDateStr ? { timestamp: { $gte: minDateStr } } : {};
+          docs = await col.find(query).sort({ timestamp: -1 }).limit(30).toArray();
+        } catch (err) {
+          console.error("Error consultando finanzas en MongoDB:", err.message);
+        }
+      }
+      if ((!docs || docs.length === 0) && Array.isArray(cloudState.recentFinances)) {
+        docs = [...cloudState.recentFinances]
+          .filter((d) => !minDateStr || String(d.dateStr || d.timestamp || "") >= minDateStr)
+          .reverse()
+          .slice(0, 30);
+      }
+      if (!docs || docs.length === 0) {
+        return "Señor Carlos, aún no hay movimientos financieros ni gastos registrados para este período.";
+      }
+
+      let totalExpenses = 0;
+      let totalIncome = 0;
+      for (const d of docs) {
+        const val = typeof d.numericAmount === "number" && d.numericAmount > 0 ? d.numericAmount : parseColombianAmount(d.amount);
+        if (d.type === "ingreso") totalIncome += val;
+        else totalExpenses += val;
+      }
+
+      const lines = docs.slice(0, 12).map((d) => {
+        const dateLabel = d.dateStr || (d.timestamp || "").split("T")[0] || "";
+        const sign = d.type === "ingreso" ? "🟢 +" : "🔴 -";
+        return `${sign}${d.amount} ➔ ${d.to}${d.description && d.description !== d.to ? ` (${d.description})` : ""} [${dateLabel}]`;
+      });
+
+      const totalsLine =
+        `\n\n📊 *Balance del período (${docs.length} mov.):*\n` +
+        `• Total gastos: *${formatColombianPesos(totalExpenses)}*\n` +
+        (totalIncome > 0 ? `• Total ingresos: *${formatColombianPesos(totalIncome)}*\n` : "");
+
+      return `Últimos movimientos financieros registrados:\n` + lines.join("\n") + totalsLine.trimEnd();
     }
     case "get_weather":
       return await getWeatherLive(args?.city || "");
@@ -1571,10 +2098,10 @@ async function executeCloudToolCall(name, args) {
       let finalTo = rawTo;
 
       // 1. Resolver correos propios del Señor Carlos si pide enviarse a su cuenta Institucional o Personal
-      const ownerUniEmail = cloudState.ownerUniEmail || "curianae@uniguajira.edu.co";
+      const ownerUniEmail = "cruriana@uniguajira.edu.co";
       const ownerPersonalEmail = cloudState.ownerPersonalEmail || "carlosuriana2007@gmail.com";
 
-      if (!rawTo.includes("@") && /(institucional|uniguajira|universidad|mi correo de la u|cuenta de la u|curianae)/i.test(lowerTo)) {
+      if (!rawTo.includes("@") && /(institucional|uniguajira|universidad|mi correo de la u|cuenta de la u|cruriana|curianae)/i.test(lowerTo)) {
         finalTo = ownerUniEmail;
       } else if (!rawTo.includes("@") && /(mi personal|correo personal|cuenta personal|carlosuriana)/i.test(lowerTo)) {
         finalTo = ownerPersonalEmail;
@@ -1635,6 +2162,16 @@ async function executeCloudToolCall(name, args) {
     }
     case "get_pending_tasks":
       return getPendingTasksSummary();
+    case "update_or_complete_agenda_task": {
+      const res = updateOrCompleteAgendaTask({
+        taskQuery: args?.taskQuery || args?.title || "",
+        action: args?.action || "complete",
+        newDueDate: args?.newDueDate || null,
+        newDueTime: args?.newDueTime || null,
+        newNotes: args?.newNotes !== undefined ? args.newNotes : null,
+      });
+      return res.ok ? res.message : res.error;
+    }
     case "get_scheduled_routines": {
       const activeList = schedules.filter((s) => s.active && !s.parentEventId);
       if (activeList.length === 0) {
@@ -1810,6 +2347,33 @@ async function executeCloudToolCall(name, args) {
         foundJid ? ` (chat vinculado: ${foundJid})` : " (cuando me indique su número o le escriba, vincularé también su chat)"
       }.`;
     }
+    case "list_or_search_contacts": {
+      const q = String(args?.query || "").trim();
+      if (q) {
+        const res = await resolveContactTargetAsync(q);
+        if (res.ok) {
+          const kind = res.jid.endsWith("@g.us") ? "Grupo de WhatsApp" : res.jid.endsWith("@lid") ? "Contacto WhatsApp (Canal LID activo)" : `Contacto (+${res.jid.split("@")[0]})`;
+          return `Sí, Señor Carlos. Tengo registrado a *${res.canonicalName}* como ${kind}. Puede pedirme que le escriba cuando desee.`;
+        }
+        return res.error;
+      }
+      const people = [];
+      const groups = [];
+      const seenJids = new Set();
+      for (const [name, rawJid] of Object.entries(cloudState.learnedContacts || {})) {
+        const jid = sanitizeAndFormatJid(rawJid);
+        if (!jid || seenJids.has(jid)) continue;
+        if (name.length < 2 || ["mama", "paula", "carlos", "señor carlos"].includes(name)) continue;
+        seenJids.add(jid);
+        if (jid.endsWith("@g.us")) groups.push(name);
+        else people.push(name);
+      }
+      return (
+        `📇 *Agenda Sincronizada de LILA:*\n` +
+        `• *Contactos directos (${people.length}):* ${people.slice(0, 35).join(", ") || "Ninguno"}\n` +
+        `• *Grupos de WhatsApp (${groups.length}):* ${groups.slice(0, 25).join(", ") || "Ninguno"}`
+      );
+    }
     case "get_chat_history": {
       const queryTarget = String(args?.contactOrGroup || "").trim();
       const limit = Math.min(Math.max(Number(args?.limit) || 15, 3), 40);
@@ -1860,7 +2424,7 @@ async function executeCloudToolCall(name, args) {
     }
     case "set_busy_mode": {
       const isActive = Boolean(args?.active);
-      const reason = String(args?.reason || "ocupado en este momento").trim();
+      const reason = String(args?.reason || "en modo no molestar").trim();
       const durationMins = Number(args?.durationMinutes) || 0;
       cloudState.busyMode = {
         active: isActive,
@@ -1868,12 +2432,31 @@ async function executeCloudToolCall(name, args) {
         untilTimestamp: isActive && durationMins > 0 ? Date.now() + durationMins * 60 * 1000 : null,
       };
       busyAutoRepliedAt.clear();
+      for (const t of busyPendingTimers.values()) {
+        if (t?.timer) clearTimeout(t.timer);
+      }
+      busyPendingTimers.clear();
       saveCloudState();
       if (!isActive) {
-        return "Modo Ocupado desactivado, Señor Carlos. Ya no responderé automáticamente en sus chats privados.";
+        return "Modo No Molestar / Ocupado desactivado, Señor Carlos. Ya no responderé automáticamente en sus chats privados y la voz de su portátil vuelve a estar activa.";
       }
       const durText = durationMins > 0 ? ` durante ${durationMins} minutos` : "";
-      return `Modo Ocupado activado (${reason}${durText}). Atenderé únicamente chats privados (con espera de 35s, prioridad Familia VIP, pausa automática si usted chatea y cero spam en grupos).`;
+      return `Modo No Molestar / Ocupado activado (${reason}${durText}). Atenderé únicamente sus chats privados (espera de 35s, prioridad Familia VIP, pausa automática si usted chatea, silencio en el portátil y cero spam en grupos).`;
+    }
+    case "get_daily_briefing": {
+      return await generateMorningBriefing();
+    }
+    case "execute_on_laptop": {
+      const cmdText = String(args?.command || "").trim();
+      if (!cmdText) return "Por favor indique qué comando desea ejecutar en su portátil.";
+      const cmdObj = {
+        id: "desk_" + Date.now().toString(36),
+        command: cmdText,
+        createdAt: new Date().toISOString(),
+      };
+      pendingDeskCommands.push(cmdObj);
+      if (pendingDeskCommands.length > 20) pendingDeskCommands.shift();
+      return `Orden remota encolada para LILA Desk (su portátil): "${cmdText}". En cuanto su portátil sincronice, la ejecutará y le enviará el resultado aquí al grupo LILA.`;
     }
     case "search_web_live": {
       return await searchWebLive(String(args?.query || ""));
@@ -2101,6 +2684,22 @@ async function callGeminiWithFallback(
           continue;
         }
 
+        // Guardia anti-alucinación: si la IA afirma haber activado/desactivado el Modo No Molestar / Modo Ocupado sin haber llamado a set_busy_mode
+        const claimedBusyModeChanged =
+          /(modo\s+(no\s+molestar|ocupado).*(activado|desactivado)|he\s+(activado|desactivado)\s+el\s+modo\s+(no\s+molestar|ocupado)|activar[eé]\s+el\s+modo\s+(no\s+molestar|ocupado))/i.test(
+            stepText
+          ) || /\b(activa|prende|pon|habilita|desactiva|apaga|quita).*(modo\s+no\s+molestar|no\s+molestar|modo\s+ocupado)\b/i.test(userPromptText);
+        if (enableTools && claimedBusyModeChanged && !calledTools.has("set_busy_mode")) {
+          const wantsOff = /\b(desactiva|apaga|quita|termina|sal\s+de|cancela)\b/i.test(userPromptText);
+          calledTools.add("set_busy_mode");
+          const busyRes = await executeCloudToolCall("set_busy_mode", {
+            active: !wantsOff,
+            reason: "en modo no molestar",
+          });
+          lastToolResultsSummary = busyRes;
+          return { ok: true, text: stepText || busyRes };
+        }
+
         if (stepText) return { ok: true, text: stepText };
         if (lastToolResultsSummary) return { ok: true, text: lastToolResultsSummary };
         break;
@@ -2116,11 +2715,182 @@ async function callGeminiWithFallback(
   return { ok: false, error: lastError };
 }
 
-// --- MAPAS DE ESTADO EN MEMORIA PARA MODO OCUPADO INTELIGENTE Y CONVERSACIONES DELEGADAS ---
+// --- MAPAS DE ESTADO EN MEMORIA PARA MODO OCUPADO INTELIGENTE, CONVERSACIONES DELEGADAS Y CONTROL REMOTO DESK ---
 const activeDelegatedChats = new Map();
 const busyAutoRepliedAt = new Map();
 const lastOwnerManualMessageByJid = new Map();
 const busyPendingTimers = new Map();
+const pendingDeskCommands = [];
+
+// --- TRANSCRIPCIÓN DE NOTAS DE VOZ (Groq Whisper + Respaldo Gemini Multimodal) Y VISIÓN DE IMÁGENES ---
+async function transcribeWhatsAppAudioMessage(msg, innerMsg) {
+  if (!innerMsg?.audioMessage || typeof downloadMediaMessage !== "function") return null;
+  try {
+    const audioBuffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger: silentLogger, reuploadRequest: sock?.updateMediaMessage }
+    );
+    if (!audioBuffer || audioBuffer.length === 0) return null;
+
+    // 1. Intento ultrarrápido con Groq Whisper (whisper-large-v3-turbo)
+    if (GROQ_API_KEY && typeof FormData !== "undefined" && typeof Blob !== "undefined") {
+      try {
+        const form = new FormData();
+        const mime = innerMsg.audioMessage.mimetype || "audio/ogg";
+        const blob = new Blob([audioBuffer], { type: mime });
+        form.append("file", blob, "voice_note.ogg");
+        form.append("model", "whisper-large-v3-turbo");
+        form.append("language", "es");
+        form.append("response_format", "json");
+
+        const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+          body: form,
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const text = String(data?.text || "").trim();
+          if (text) {
+            console.log(`[LILA Audio] 🎙️ Nota de voz transcrita (Groq Whisper): "${text.slice(0, 80)}"`);
+            return text;
+          }
+        }
+      } catch (groqErr) {
+        console.error("[LILA Audio] Fallback de Groq Whisper a Gemini:", groqErr.message);
+      }
+    }
+
+    // 2. Respaldo multimodal con Gemini 2.5 Flash
+    if (GEMINI_API_KEY) {
+      const base64Audio = audioBuffer.toString("base64");
+      const mimeType = (innerMsg.audioMessage.mimetype || "audio/ogg").split(";")[0].trim();
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inlineData: { mimeType, data: base64Audio } },
+                {
+                  text: "Transcribe exactamente lo que se dice en esta nota de voz en español. Devuelve ÚNICAMENTE el texto transcrito, sin explicaciones ni comillas.",
+                },
+              ],
+            },
+          ],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 400 },
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const text = (data?.candidates?.[0]?.content?.parts || [])
+          .map((p) => p.text || "")
+          .join(" ")
+          .trim();
+        if (text) {
+          console.log(`[LILA Audio] 🎙️ Nota de voz transcrita (Gemini): "${text.slice(0, 80)}"`);
+          return text;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("[LILA Audio] Error descargando/transcribiendo nota de voz:", err.message);
+  }
+  return null;
+}
+
+async function downloadWhatsAppImageBase64(msg, innerMsg) {
+  if (!innerMsg?.imageMessage || typeof downloadMediaMessage !== "function") return null;
+  try {
+    const imgBuffer = await downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger: silentLogger, reuploadRequest: sock?.updateMediaMessage }
+    );
+    if (!imgBuffer || imgBuffer.length === 0) return null;
+    const mimeType = (innerMsg.imageMessage.mimetype || "image/jpeg").split(";")[0].trim();
+    return { mimeType, data: imgBuffer.toString("base64") };
+  } catch (err) {
+    console.error("[LILA Vision] Error descargando imagen de WhatsApp:", err.message);
+    return null;
+  }
+}
+
+// --- INFORME EJECUTIVO MATUTINO AUTOMÁTICO (BRIEFING DIARIO) ---
+async function generateMorningBriefing() {
+  const { dateStr: todayStr, readable } = getColombiaNowParts();
+  let weatherText = "";
+  try {
+    weatherText = await getWeatherLive("");
+  } catch (_) {
+    weatherText = "- Riohacha y Hatonuevo: ~30 °C.";
+  }
+
+  const pendingTasks = (cloudState.agendaTasks || [])
+    .filter((t) => !t.completed && t.dueDate >= todayStr)
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+
+  let agendaSection = "Sin tareas ni parciales pendientes registrados para los próximos días.";
+  if (pendingTasks.length > 0) {
+    agendaSection = pendingTasks
+      .slice(0, 5)
+      .map((t) => {
+        const diff = calculateDaysDifference(t.dueDate, todayStr);
+        const tag = diff === 0 ? "🚨 *¡HOY!*" : diff === 1 ? "⚠️ *Mañana*" : `📅 En ${diff} días (${t.dueDate})`;
+        return `• ${tag}: *${t.title}*${t.notes ? ` (${t.notes})` : ""}`;
+      })
+      .join("\n");
+  }
+
+  let mailSection = "Sin correos urgentes nuevos en las últimas horas.";
+  try {
+    const importantMails = [];
+    const pCreds = resolveGmailAccountCreds("Personal");
+    const uCreds = resolveGmailAccountCreds("Uniguajira");
+    const accs = [];
+    if (uCreds) accs.push(["Uniguajira", uCreds]);
+    if (pCreds) accs.push(["Personal", pCreds]);
+    for (const [accName, creds] of accs) {
+      try {
+        const r = await queryGmailAccountLive(accName, creds, "is:unread newer_than:1d", 3);
+        for (const em of r?.emails || []) {
+          const cls = classifyIncomingEmail({ from: em.from, subject: em.subject, snippet: em.snippet, account: accName });
+          if (!cls.isSpam) {
+            importantMails.push(`• [${accName}] *${em.subject}* (${em.from.split("<")[0].trim()})`);
+          }
+        }
+      } catch (_) {}
+    }
+    if (importantMails.length > 0) {
+      mailSection = importantMails.slice(0, 4).join("\n");
+    }
+  } catch (_) {}
+
+  const momRoutine = schedules.find(
+    (s) => s.active && s.recurring && (String(s.target).includes(MOM_LID_JID) || /pechy|paula|mam/i.test(String(s.contactName || "")))
+  );
+  const momStatus = momRoutine
+    ? momRoutine.lastSentDate === todayStr
+      ? `✅ Saludo de las ${momRoutine.time} a su mamá (Pechy) enviado.`
+      : `⏰ Saludo a su mamá (Pechy) programado para las ${momRoutine.time}.`
+    : "Sin rutina matutina activa.";
+
+  return (
+    `☀️ *Informe Ejecutivo Matutino de LILA*\n` +
+    `🗓️ *${readable}*\n\n` +
+    `🌤️ *Clima en La Guajira:*\n${weatherText}\n\n` +
+    `📚 *Agenda y Compromisos (${pendingTasks.length}):*\n${agendaSection}\n\n` +
+    `📧 *Correos Importantes No Leídos:*\n${mailSection}\n\n` +
+    `❤️ *Familia:* ${momStatus}\n\n` +
+    `Que tenga un excelente y productivo día, Señor Carlos.`
+  );
+}
 
 // --- BÚSQUEDA WEB EN TIEMPO REAL (Gemini Google Search Grounding + Respaldo Wikipedia/DDG) ---
 async function searchWebLive(query) {
@@ -2196,8 +2966,8 @@ async function searchWebLive(query) {
   return `Consulta procesada para "${cleanQ}". Responde utilizando tu conocimiento general actualizado.`;
 }
 
-// --- CEREBRO CONVERSACIONAL DE LILA EN LA NUBE ---
-async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, onProgress = null) {
+// --- CEREBRO CONVERSACIONAL DE LILA EN LA NUBE (SOPORTA TEXTO, NOTAS DE VOZ E IMÁGENES MULTIMODALES) ---
+async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, onProgress = null, inlineMedia = null) {
   const { dateStr, timeStr, readable } = getColombiaNowParts();
   const locStr = cloudState.currentLocation?.placeName
     ? `Ubicación conocida del Señor Carlos: ${cloudState.currentLocation.placeName}.`
@@ -2211,7 +2981,7 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
       ? `\n12. CONTEXTO DEL ÚLTIMO CORREO LEÍDO (solo si pide responder correo con send_or_reply_gmail): De: ${cloudState.lastEmailContext.from} | Correo exacto: ${cloudState.lastEmailContext.emailAddress || cloudState.lastEmailContext.from} | Asunto: "${cloudState.lastEmailContext.subject}" | Bandeja: ${cloudState.lastEmailContext.account}.`
       : "";
 
-  const ownerUniEmail = cloudState.ownerUniEmail || "curianae@uniguajira.edu.co";
+  const ownerUniEmail = "cruriana@uniguajira.edu.co";
   const ownerPersonalEmail = cloudState.ownerPersonalEmail || "carlosuriana2007@gmail.com";
   const inExternalDirectChat =
     jid &&
@@ -2247,20 +3017,26 @@ async function askLilaCloudAI(userPrompt, jid = "default", allowTools = true, on
     "1. Tu único nombre es LILA. NUNCA digas 'LILA 2.0', NUNCA menciones a 'J.A.R.V.I.S.' y NUNCA digas que fuiste creada por Google. Tu creador es el Señor Carlos.\n" +
     "2. Dirígete siempre al usuario como 'Señor' o 'Señor Carlos', manteniendo siempre ortografía impecable en español (tildes y signos ¿? ¡! completos).\n" +
     "3. CONSCIENCIA HÍBRIDA (NUBE Y ESCRITORIO): Sabes que existes en dos nodos coordinados: LILA Cloud (este nodo en la nube 24/7 en WhatsApp y Telegram) y LILA Desk (el nodo en el portátil del Señor Carlos). Ambos comparten la misma agenda y contactos en tiempo real.\n" +
-    "4. TAREAS Y RECORDATORIOS INMEDIATOS: Si el Señor Carlos pide que le recuerdes algo hoy o a cierta hora (ej. 'recuérdame ir al gym a las 3 pm'), invoca SIEMPRE `schedule_whatsapp_message` con `target: 'lila_group'`, `time` en formato 24h ('15:00') y `recurring: false`. Si dice que tiene una entrega o examen para cierto día, agenda con `add_agenda_event`. NUNCA digas que vas a recordarle algo sin haber invocado `schedule_whatsapp_message` o `add_agenda_event`.\n" +
+    "4. TAREAS, AGENDA Y FINANZAS: Si el Señor Carlos pide que le recuerdes algo hoy o a cierta hora (ej. 'recuérdame ir al gym a las 3 pm'), invoca SIEMPRE `schedule_whatsapp_message` con `target: 'lila_group'`, `time` en formato 24h ('15:00') y `recurring: false`. Si dice que tiene una entrega o examen para cierto día, agenda con `add_agenda_event`. Si dice que ya entregó/terminó una tarea, que se canceló o cambió de fecha, invoca `update_or_complete_agenda_task`. Si pide anotar un gasto, pago, transferencia o ingreso, invoca `record_finance_transaction`.\n" +
     `5. CORREOS GMAIL PROPIOS DEL SEÑOR CARLOS: Su correo Personal es '${ownerPersonalEmail}' y su correo Institucional/Uniguajira es '${ownerUniEmail}'. Si pide enviar un correo 'a mi institucional' o 'a mi cuenta de la universidad', el destinatario 'to' es SIEMPRE '${ownerUniEmail}' (jamás uses correos de terceros como comunicaciones@uniguajira.edu.co). Si pide enviar 'a mi correo personal', el destinatario 'to' es '${ownerPersonalEmail}'.\n` +
     "6. ÓRDENES MÚLTIPLES Y GRUPOS DE WHATSAPP: Si el Señor Carlos pide dos o más cosas en un mismo mensaje, invoca TODAS las herramientas necesarias. Si te pide escribir o presentarte en OTRO grupo o contacto de WhatsApp (ej. 'escríbele en el grupo Cuarto gamer' o 'mándale un mensaje a mi mamá'), invoca `send_whatsapp_message` con el nombre en `target`.\n" +
     `7. FAMILIA Y VÍNCULOS APRENDIDOS (${relPairs}): Mamá es Paula (él le dice 'Pechy', saludo natural sin cursilerías). Tiene dos hermanas: Nelly y Perla. Si el Señor Carlos te enseña un vínculo nuevo (ej. 'mi prima es Vero' o 'el número de Vero es...'), invoca \`save_contact_or_relationship\` para aprenderlo permanentemente.\n` +
-    "8. MEMORIA DE CHATS, DELEGACIÓN Y MODO OCUPADO: Si el Señor Carlos pregunta qué le dijo alguien ('¿qué me dijo mi mamá?', '¿de qué hablaron en el grupo?'), invoca `get_chat_history`. Si te pide hablar con alguien para averiguar algo ('pregúntale a mi mamá qué hará de almuerzo y me avisas'), invoca `delegate_conversation`. Si dice que va a estar ocupado, durmiendo, en clase o en el gym ('activa modo ocupado porque estoy en clase'), invoca `set_busy_mode`. Estado actual del Modo Ocupado: " +
+    "8. MEMORIA DE CHATS, DELEGACIÓN, CONTACTOS Y MODO NO MOLESTAR / OCUPADO: Si el Señor Carlos pregunta qué le dijo alguien ('¿qué me dijo mi mamá?', '¿de qué hablaron en el grupo?'), invoca `get_chat_history`. Si pregunta si tienes un contacto o pide ver sus contactos, invoca `list_or_search_contacts`. Si te pide hablar con alguien para averiguar algo ('pregúntale a mi mamá qué hará de almuerzo y me avisas'), invoca `delegate_conversation`. Si dice que va a estar ocupado, que no lo molesten, durmiendo, en clase o en el gym ('activa modo no molestar', 'activa modo ocupado'), invoca `set_busy_mode`. Estado actual del Modo No Molestar / Ocupado: " +
     busyStatusStr +
     ".\n" +
-    "9. BÚSQUEDA WEB EN TIEMPO REAL Y CONOCIMIENTO EXPERTA: Posees la herramienta `search_web_live` para buscar información en tiempo real en internet (noticias, precios, clima, resultados) y conocimiento experto sobre cualquier plataforma o software (como Animaker, Canva, programación, etc.). JAMÁS digas que tus capacidades están limitadas a los correos.\n" +
+    "9. BÚSQUEDA WEB, BRIEFING MATUTINO Y CONTROL REMOTO DEL PORTÁTIL: Posees `search_web_live` para buscar información en tiempo real en Google, `get_daily_briefing` para entregarle el informe ejecutivo del día, y `execute_on_laptop` para enviar órdenes remotas a su portátil Windows (LILA Desk) cuando pida controlar música, ver batería o crear documentos en su PC. También puedes analizar imágenes (comprobantes de Nequi, horarios, tableros) y notas de voz que el Señor Carlos te envíe.\n" +
     `11. FECHA Y HORA ACTUAL: Hoy es ${readable} (${dateStr}), hora actual en Colombia: ${timeStr}. ${locStr}${routinesInfo}${chatContextHint}${lastMailInfo}`;
 
   const history = chatHistoryByJid.get(jid) || [];
+  const userParts = [];
+  if (inlineMedia && inlineMedia.data && inlineMedia.mimeType) {
+    userParts.push({ inlineData: { mimeType: inlineMedia.mimeType, data: inlineMedia.data } });
+  }
+  userParts.push({ text: userPrompt });
+
   const geminiContents = [
     ...history.map((h) => ({ role: h.role === "assistant" ? "model" : "user", parts: [{ text: h.text }] })),
-    { role: "user", parts: [{ text: userPrompt }] },
+    { role: "user", parts: userParts },
   ];
 
   const gemRes = await callGeminiWithFallback(systemPrompt, geminiContents, allowTools, onProgress, userPrompt);
@@ -2562,6 +3338,21 @@ async function startWhatsApp() {
     scheduleSyncAuthToMongo(500);
   });
 
+  // Sincronización automática de la agenda de contactos y chats del teléfono en WhatsApp
+  sock.ev.on("contacts.upsert", (contacts) => {
+    ingestBaileysContactsList(contacts);
+  });
+  sock.ev.on("contacts.update", (updates) => {
+    ingestBaileysContactsList(updates);
+  });
+  sock.ev.on("chats.upsert", (chats) => {
+    ingestBaileysContactsList(chats);
+  });
+  sock.ev.on("messaging-history.set", ({ contacts, chats }) => {
+    if (Array.isArray(contacts)) ingestBaileysContactsList(contacts);
+    if (Array.isArray(chats)) ingestBaileysContactsList(chats);
+  });
+
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
     if (qr) {
@@ -2656,14 +3447,20 @@ async function startWhatsApp() {
 
         const participantJid = msg.key.participant || "";
         const isGroup = remoteJid.endsWith("@g.us");
+        const ownerLidPrefix = (sock.user?.lid || "218249585266876").split(":")[0].split("@")[0];
+        const isOfficialLilaGroup =
+          isGroup &&
+          ((cloudState.lilaNotificationGroupJid && remoteJid === cloudState.lilaNotificationGroupJid) ||
+            remoteJid === "120363431453009179@g.us");
         const isOwnerOrSelf =
           Boolean(msg.key.fromMe) ||
           Boolean(OWNER_PHONE && participantJid.includes(OWNER_PHONE)) ||
           Boolean(connectedNumber && participantJid.includes(connectedNumber)) ||
+          Boolean(ownerLidPrefix && participantJid.includes(ownerLidPrefix)) ||
           (!isGroup &&
             ((OWNER_PHONE && remoteJid.includes(OWNER_PHONE)) ||
               (connectedNumber && remoteJid.includes(connectedNumber)) ||
-              remoteJid.endsWith("@lid")));
+              (ownerLidPrefix && remoteJid.includes(ownerLidPrefix))));
 
         let innerMsg = msg.message;
         for (let depth = 0; depth < 4 && innerMsg; depth++) {
@@ -2677,36 +3474,88 @@ async function startWhatsApp() {
           if (!next) break;
           innerMsg = next;
         }
-        const text =
+        let text =
           innerMsg?.conversation ||
           innerMsg?.extendedTextMessage?.text ||
           innerMsg?.imageMessage?.caption ||
           innerMsg?.videoMessage?.caption ||
           "";
+
+        const hasAudio = Boolean(innerMsg?.audioMessage);
+        const hasImage = Boolean(innerMsg?.imageMessage);
+        const hasDelegatedOrBusyForContact =
+          !isGroup &&
+          !msg.key.fromMe &&
+          (activeDelegatedChats.has(remoteJid) || Boolean(cloudState.busyMode?.active));
+
+        // 1.1 Si es una NOTA DE VOZ (del Señor Carlos en el grupo LILA, o de un contacto en Modo No Molestar / Conversación Delegada)
+        let isVoiceNoteCommand = false;
+        if (!text && hasAudio && msgAgeSeconds <= 90 && !lilaGeneratedMsgIds.has(msgId)) {
+          if ((isOwnerOrSelf && (isOfficialLilaGroup || !isGroup)) || hasDelegatedOrBusyForContact) {
+            const transcribed = await transcribeWhatsAppAudioMessage(msg, innerMsg);
+            if (transcribed) {
+              text = transcribed;
+              if (isOwnerOrSelf && isOfficialLilaGroup && !/^lila\b/i.test(text.trim())) {
+                text = `Lila, ${text}`;
+              }
+              isVoiceNoteCommand = true;
+            } else if (hasDelegatedOrBusyForContact) {
+              text = "[Envió una nota de voz]";
+            }
+          }
+        }
+
+        // 1.2 Si es una IMAGEN (comprobante Nequi, horario, foto) enviada por el Señor Carlos al grupo LILA o con "Lila..."
+        let inlineMedia = null;
+        if (hasImage && msgAgeSeconds <= 90 && isOwnerOrSelf && !lilaGeneratedMsgIds.has(msgId)) {
+          if (isOfficialLilaGroup || /^lila\b/i.test(String(text || "").trim())) {
+            inlineMedia = await downloadWhatsAppImageBase64(msg, innerMsg);
+            if (inlineMedia && !text.trim()) {
+              text = "Lila, analiza detalladamente esta imagen. Si es un comprobante de pago o transferencia (Nequi/Bancolombia), regístralo en mis finanzas; si contiene fechas de exámenes o tareas, agéndalas; y dame un resumen claro.";
+            } else if (inlineMedia && isOfficialLilaGroup && !/^lila\b/i.test(text.trim())) {
+              text = `Lila, ${text}`;
+            }
+          }
+        }
+
+        // 1.3 Si un contacto envía foto/sticker/documento en Modo No Molestar sin caption, igual atenderlo
+        if (!text && !isGroup && !msg.key.fromMe && hasDelegatedOrBusyForContact && msgAgeSeconds <= 90) {
+          if (hasImage) text = "[Envió una imagen]";
+          else if (innerMsg?.videoMessage) text = "[Envió un video]";
+          else if (innerMsg?.documentMessage) text = `[Envió un documento: ${innerMsg.documentMessage.fileName || "archivo"}]`;
+          else if (innerMsg?.stickerMessage) text = "[Envió un sticker]";
+        }
+
         if (!text) continue;
 
         const pushName = msg.pushName || (participantJid ? participantJid.split("@")[0] : remoteJid.split("@")[0]);
         const { dateStr: todayDateStr, timeStr: nowCol } = getColombiaNowParts();
 
-        if (
-          !msg.key.fromMe &&
-          pushName &&
-          (remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@lid"))
-        ) {
-          const cleanPush = pushName.toLowerCase().trim();
-          if (cleanPush && cleanPush !== "hermana" && !/^\d+$/.test(cleanPush)) {
-            if (cloudState.learnedContacts[cleanPush] !== remoteJid) {
-              cloudState.learnedContacts[cleanPush] = remoteJid;
-              saveCloudState();
-            }
+        // Aprender automáticamente contactos de chats privados y participantes que escriben en grupos
+        if (!msg.key.fromMe && pushName) {
+          if (!isGroup && (remoteJid.endsWith("@s.whatsapp.net") || remoteJid.endsWith("@lid"))) {
+            learnContactEntry(pushName, remoteJid, true);
+          } else if (isGroup && participantJid) {
+            learnContactEntry(pushName, participantJid, true);
           }
         }
 
         const cleanText = text.trim();
-        if (cleanText.startsWith("🤖 *LILA:*") || cleanText.startsWith("⏰ *Recordatorio LILA:*")) continue;
+        const isLilaOwnSentMsg =
+          lilaGeneratedMsgIds.has(msgId) ||
+          cleanText.startsWith("🤖 *LILA:*") ||
+          cleanText.startsWith("⏰ *Recordatorio LILA:*") ||
+          cleanText.startsWith("☀️ *Informe Ejecutivo") ||
+          cleanText.startsWith("📧 *Nuevo Correo") ||
+          cleanText.startsWith("🤝 *Reporte de Conversación") ||
+          cleanText.startsWith("💻 *Reporte de LILA Desk") ||
+          cleanText.startsWith("🚨 *URGENCIA") ||
+          cleanText.startsWith("❤️ *Mensaje VIP") ||
+          cleanText.startsWith("📌 *Recado");
+        if (isLilaOwnSentMsg) continue;
 
-        // Si el Señor Carlos escribe manualmente en un chat, activamos la Pausa Automática de 20 min del Modo Ocupado en ese chat
-        if (msg.key.fromMe) {
+        // Si el Señor Carlos escribe MANUALMENTE en un chat privado (y no es un mensaje generado por LILA), activamos la Pausa Automática de 20 min del Modo No Molestar en ese chat
+        if (msg.key.fromMe && !isGroup) {
           lastOwnerManualMessageByJid.set(remoteJid, Date.now());
           const pendingTimer = busyPendingTimers.get(remoteJid);
           if (pendingTimer) {
@@ -2720,7 +3569,7 @@ async function startWhatsApp() {
           const logEntry = {
             from: pushName,
             jid: remoteJid,
-            body: cleanText,
+            body: isVoiceNoteCommand ? `🎙️ [Nota de voz]: ${cleanText}` : cleanText,
             dateStr: todayDateStr,
             time: nowCol,
             timestamp: Date.now(),
@@ -2774,6 +3623,21 @@ async function startWhatsApp() {
             }
           }
 
+          // Interruptor directo de Modo No Molestar / Modo Ocupado (garantiza activación/desactivación inmediata)
+          if (/^(apaga|desactiva|quita|termina|cancela)\s+(el\s+)?(modo\s+)?(no\s+molestar|ocupado)\b/i.test(rawQuery)) {
+            const resText = await executeCloudToolCall("set_busy_mode", { active: false });
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${resText}` }, { quoted: msg });
+            continue;
+          }
+          if (/^(activa|prende|pon|habilita|enciende)\s+(el\s+)?(modo\s+)?(no\s+molestar|ocupado)$/i.test(rawQuery)) {
+            const resText = await executeCloudToolCall("set_busy_mode", {
+              active: true,
+              reason: /no\s+molestar/i.test(rawQuery) ? "en modo no molestar" : "ocupado en este momento",
+            });
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${resText}` }, { quoted: msg });
+            continue;
+          }
+
           // Interruptor de voz/texto para prender o apagar el Modo Invitado
           if (/(apaga|desactiva|silencia|bloquea).*(modo\s+invitado|invitados|amigos|grupo)/i.test(rawQuery)) {
             cloudState.guestModeEnabled = false;
@@ -2807,9 +3671,10 @@ async function startWhatsApp() {
               await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${partialText.trim()}` }, { quoted: msg });
             }
           };
-          const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate);
+          const reply = await askLilaCloudAI(query, historyKey, true, sendIntermediate, inlineMedia);
           if (reply && reply.trim()) {
-            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${reply.trim()}` }, { quoted: msg });
+            const voicePrefix = isVoiceNoteCommand ? `🎙️ _"${rawQuery}"_\n\n` : "";
+            await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${voicePrefix}${reply.trim()}` }, { quoted: msg });
           }
           continue;
         }
@@ -2864,13 +3729,35 @@ function isTimeWithinMinutesWindow(targetHHMM, currentHHMM, maxWindowMinutes = 3
   return currentMins >= targetMins && currentMins - targetMins <= maxWindowMinutes;
 }
 
-// --- EVALUADOR DE RUTINAS Y RECORDATORIOS ESCALONADOS (Evita horas pasadas) ---
+// --- EVALUADOR DE RUTINAS, BRIEFING MATUTINO Y RECORDATORIOS ESCALONADOS (Evita horas pasadas) ---
 let isEvaluatingSchedules = false;
 async function evaluateSchedules() {
   if (connectionStatus !== "connected" || !sock || isEvaluatingSchedules) return;
   isEvaluatingSchedules = true;
   try {
     const { dateStr: todayStr, timeStr: currentHHMM } = getColombiaNowParts();
+
+    // 0. Informe Ejecutivo Matutino Automático (07:05 a. m. hora de Colombia)
+    if (
+      cloudState.lastMorningBriefingDate !== todayStr &&
+      isTimeWithinMinutesWindow("07:05", currentHHMM, 35)
+    ) {
+      const notifyJid = getOwnerNotificationJid();
+      if (notifyJid) {
+        cloudState.lastMorningBriefingDate = todayStr;
+        saveCloudState();
+        try {
+          const briefingText = await generateMorningBriefing();
+          await safeSendMessage(notifyJid, { text: briefingText });
+          if (cloudState.telegramChatId) {
+            await sendTelegramMessage(cloudState.telegramChatId, briefingText);
+          }
+          console.log(`[LILA] ☀️ Informe Ejecutivo Matutino enviado al grupo LILA (${todayStr}).`);
+        } catch (bErr) {
+          console.error("[LILA] Error enviando Informe Matutino:", bErr.message);
+        }
+      }
+    }
 
     let changed = false;
     for (const item of schedules) {
@@ -2941,7 +3828,98 @@ async function evaluateSchedules() {
   }
 }
 
-// Vigía proactivo de Gmail en la nube (Envía notificaciones al grupo LILA y a Telegram)
+// Clasificador inteligente de correos entrantes (0 tokens para publicidad, detección OTP y auto-registro financiero)
+function classifyIncomingEmail({ from = "", subject = "", snippet = "", account = "Personal" }) {
+  const combined = `${from} ${subject} ${snippet}`.toLowerCase();
+  const headerCombined = `${from} ${subject}`.toLowerCase();
+
+  // 1. Detectar si contiene un código de verificación / OTP de seguridad
+  const isSecurityOrOtp =
+    /\b(c[oó]digo|verificaci[oó]n|seguridad|otp|clave\s+din[aá]mica|token|acceso|autenticaci[oó]n|iniciar\s+sesi[oó]n|recuperaci[oó]n)\b/i.test(
+      combined
+    );
+  let otpCode = null;
+  if (isSecurityOrOtp) {
+    const codeMatch =
+      `${subject} ${snippet}`.match(/(?:c[oó]digo|code|clave|pin|token|es)[:\s-]*([0-9]{4,8})\b/i) ||
+      `${subject} ${snippet}`.match(/\b([0-9]{6})\b/);
+    if (codeMatch) {
+      otpCode = codeMatch[1];
+    }
+  }
+
+  // 2. Detectar notificación bancaria / transferencia (Nequi, Bancolombia, DaviPlata, PSE)
+  const isBankOrFinance =
+    /\b(nequi|bancolombia|daviplata|pse|transferencia|enviaste|recibiste|pagaste|compra\s+aprobada|comprobante\s+de\s+pago)\b/i.test(
+      combined
+    );
+  let financeData = null;
+  if (isBankOrFinance) {
+    const moneyMatch = `${subject} ${snippet}`.match(/\$\s*([0-9]{1,3}(?:[.,][0-9]{3})+(?:[.,][0-9]{2})?|[0-9]{4,9})/);
+    if (moneyMatch) {
+      const numVal = parseColombianAmount(moneyMatch[1]);
+      if (numVal >= 500) {
+        const isIncome = /\b(recibiste|abono|te\s+enviaron|transferencia\s+recibida)\b/i.test(combined);
+        const destMatch = `${subject} ${snippet}`.match(/(?:a|en|comercio|para)\s+([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúñÑ0-9\s.]{2,28})/);
+        financeData = {
+          numericAmount: numVal,
+          amount: formatColombianPesos(numVal),
+          type: isIncome ? "ingreso" : "gasto",
+          to: destMatch ? destMatch[1].trim() : from.split("<")[0].trim() || "Movimiento Bancario",
+          description: subject,
+        };
+      }
+    }
+  }
+
+  // 3. Prioridad alta (Universidad, ICETEX, seguridad, bancos) -> NUNCA es spam
+  const isHighPriority =
+    account === "Uniguajira" ||
+    isSecurityOrOtp ||
+    isBankOrFinance ||
+    /\b(uniguajira|\.edu\.co|universidad|icetex|parcial|examen|calificaci[oó]n|nota|profesor|docente|entrega|urgente|factura)\b/i.test(
+      combined
+    );
+
+  // 4. Filtro heurístico anti-spam y promociones (0 tokens, silencio en WhatsApp)
+  const spamKeywords = [
+    "newsletter",
+    "promocion",
+    "promoción",
+    "descuento",
+    "oferta",
+    "mercadolibre",
+    "mercado libre",
+    "linkedin",
+    "pinterest",
+    "tiktok",
+    "facebook",
+    "instagram",
+    "publicidad",
+    "unsubscribe",
+    "darse de baja",
+    "cancelar suscripción",
+    "suscripcion",
+    "cupón",
+    "cupon",
+    "temu",
+    "aliexpress",
+    "shein",
+    "duolingo",
+    "quora",
+  ];
+  const matchesSpam = spamKeywords.some((kw) => headerCombined.includes(kw) || combined.includes(kw));
+  const isSpam = !isHighPriority && matchesSpam;
+
+  return {
+    isSpam,
+    isHighPriority,
+    otpCode,
+    financeData,
+  };
+}
+
+// Vigía proactivo de Gmail en la nube (Filtra spam con 0 tokens, extrae OTP, registra finanzas y avisa al grupo LILA)
 async function pollGmailProactively() {
   if (connectionStatus !== "connected" || !sock) return;
   if (!cloudState.lilaNotificationGroupJid) {
@@ -2972,15 +3950,54 @@ async function pollGmailProactively() {
             ].slice(0, 20);
             saveCloudState();
 
-            recentEmails.push({ from: email.from, subject: email.subject, snippet: email.snippet, account: accName, time: new Date().toISOString() });
+            recentEmails.push({
+              from: email.from,
+              subject: email.subject,
+              snippet: email.snippet,
+              account: accName,
+              time: new Date().toISOString(),
+            });
             if (recentEmails.length > 20) recentEmails.shift();
+
+            const classification = classifyIncomingEmail({
+              from: email.from,
+              subject: email.subject,
+              snippet: email.snippet,
+              account: accName,
+            });
+
+            // Si es un movimiento financiero de Nequi/Bancolombia, registrarlo automáticamente en MongoDB Atlas
+            if (classification.financeData) {
+              await recordFinanceTransaction({
+                from: email.from,
+                to: classification.financeData.to,
+                amount: classification.financeData.amount,
+                numericAmount: classification.financeData.numericAmount,
+                type: classification.financeData.type,
+                category: "bancos",
+                description: classification.financeData.description,
+                rawText: email.snippet,
+                source: `gmail_${accName.toLowerCase()}`,
+                emailId: email.id,
+              });
+            }
+
+            // Si es publicidad/spam, lo silenciamos sin gastar tokens de Gemini ni enviar ruido al WhatsApp
+            if (classification.isSpam) {
+              console.log(`[LILA Gmail] 🔇 Correo publicitario filtrado (${accName}): "${email.subject}" de ${email.from}`);
+              continue;
+            }
 
             const summary = await askLilaCloudAI(
               `Correo nuevo en '${accName}' del Señor Carlos.\nDe: ${email.from}\nAsunto: ${email.subject}\nContenido: ${email.snippet}\nRedacta un aviso de máximo 2 líneas con ortografía impecable.`,
               "routine",
               false
             );
-            const alertText = `📧 *Nuevo Correo (${accName})*\n*De:* ${email.from}\n*Asunto:* ${email.subject}\n\n🤖 *LILA:* ${summary}`;
+            const otpLine = classification.otpCode ? `\n🔑 *Código de verificación:* \`${classification.otpCode}\`` : "";
+            const finLine = classification.financeData
+              ? `\n💰 *Registrado en Finanzas:* ${classification.financeData.type.toUpperCase()} de ${classification.financeData.amount}`
+              : "";
+            const alertText = `📧 *Nuevo Correo (${accName})*\n*De:* ${email.from}\n*Asunto:* ${email.subject}${otpLine}${finLine}\n\n🤖 *LILA:* ${summary}`;
             await safeSendMessage(notifyJid, { text: alertText });
             if (cloudState.telegramChatId) {
               await sendTelegramMessage(cloudState.telegramChatId, alertText);
@@ -3012,11 +4029,16 @@ app.get("/ping", async (req, res) => {
 });
 
 app.get("/status", requireAuth, async (req, res) => {
+  const loc =
+    cloudState.currentLocation?.placeName ||
+    (cloudState.currentLocation?.wifiSsid ? `Wi-Fi: ${cloudState.currentLocation.wifiSsid}` : "Riohacha / Hatonuevo");
   res.json({
     ok: true,
     service: "LILA Cloud",
     whatsapp: connectionStatus,
     connectedNumber,
+    location: loc,
+    busyMode: cloudState.busyMode,
     telegramLinked: Boolean(cloudState.telegramChatId),
     mongoConnected: isMongoConnected,
     gmailSynced: {
@@ -3028,14 +4050,40 @@ app.get("/status", requireAuth, async (req, res) => {
   });
 });
 
-// Sincronización bidireccional LILA Desk ↔ LILA Server
+app.get("/messages", requireAuth, (req, res) => {
+  const rawContact = String(req.query.contact || "").trim();
+  const limit = Math.min(Math.max(Number(req.query.limit) || 15, 1), 50);
+  let filtered = [...inboxMessages];
+
+  if (rawContact) {
+    const lowerQ = rawContact.toLowerCase();
+    const resolved = resolveContactTarget(rawContact);
+    const resolvedJid = resolved.ok ? resolved.jid : null;
+    filtered = filtered.filter((m) => {
+      const mFrom = String(m.from || "").toLowerCase();
+      const mJid = String(m.jid || "").toLowerCase();
+      return (
+        mFrom.includes(lowerQ) ||
+        mJid.includes(lowerQ) ||
+        (resolvedJid && mJid.includes(resolvedJid.split("@")[0]))
+      );
+    });
+  }
+
+  res.json(filtered.slice(-limit));
+});
+
+// Sincronización bidireccional LILA Desk ↔ LILA Server (Contactos, Agenda, Modo No Molestar y Control Remoto)
 app.get("/sync", requireAuth, (req, res) => {
+  const commandsToDeliver = pendingDeskCommands.splice(0, pendingDeskCommands.length);
   res.json({
     ok: true,
     schedules: schedules.filter((s) => s.active),
     agendaTasks: cloudState.agendaTasks.filter((t) => !t.completed),
     learnedContacts: cloudState.learnedContacts,
     currentLocation: cloudState.currentLocation,
+    busyMode: cloudState.busyMode,
+    pendingDeskCommands: commandsToDeliver,
     recentEmails: recentEmails.slice(-10),
   });
 });
@@ -3047,9 +4095,7 @@ app.post("/sync", requireAuth, (req, res) => {
       for (const [k, v] of Object.entries(contacts)) {
         const cleanK = String(k).toLowerCase().trim();
         if (cleanK && cleanK !== "hermana" && v) {
-          let digits = String(v).replace(/\D/g, "");
-          if (digits.length === 10 && digits.startsWith("3")) digits = "57" + digits;
-          if (digits.length >= 10) cloudState.learnedContacts[cleanK] = `${digits}@s.whatsapp.net`;
+          learnContactEntry(cleanK, v, false);
         }
       }
     }
@@ -3068,12 +4114,32 @@ app.post("/sync", requireAuth, (req, res) => {
       }
     }
     saveCloudState();
+    const commandsToDeliver = pendingDeskCommands.splice(0, pendingDeskCommands.length);
     res.json({
       ok: true,
       schedules: schedules.filter((s) => s.active),
       agendaTasks: cloudState.agendaTasks.filter((t) => !t.completed),
       learnedContacts: cloudState.learnedContacts,
+      busyMode: cloudState.busyMode,
+      pendingDeskCommands: commandsToDeliver,
     });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/desk-command-result", requireAuth, async (req, res) => {
+  try {
+    const { command, result } = req.body || {};
+    const notifyJid = getOwnerNotificationJid();
+    const reportText = `💻 *Reporte de LILA Desk (Portátil):*\n• *Orden:* "${command || "Comando remoto"}"\n• *Resultado:* ${result || "Ejecutado exitosamente."}`;
+    if (notifyJid && connectionStatus === "connected" && sock) {
+      await safeSendMessage(notifyJid, { text: reportText });
+    }
+    if (cloudState.telegramChatId) {
+      await sendTelegramMessage(cloudState.telegramChatId, reportText);
+    }
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }
@@ -3083,6 +4149,19 @@ app.post("/agenda", requireAuth, (req, res) => {
   const { title, dueDate, dueTime = "07:00", notes = "" } = req.body || {};
   if (!title || !dueDate) return res.status(400).json({ success: false, error: "Faltan title o dueDate." });
   const result = createAgendaEventWithReminders({ title, dueDate, dueTime, notes });
+  res.json({ success: true, ...result });
+});
+
+app.post("/agenda/update", requireAuth, (req, res) => {
+  const { taskQuery, title, action = "complete", newDueDate = null, newDueTime = null, newNotes = null } = req.body || {};
+  const result = updateOrCompleteAgendaTask({
+    taskQuery: taskQuery || title || "",
+    action,
+    newDueDate,
+    newDueTime,
+    newNotes,
+  });
+  if (!result.ok) return res.status(404).json({ success: false, error: result.error });
   res.json({ success: true, ...result });
 });
 
