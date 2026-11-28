@@ -88,6 +88,10 @@ let cloudState = {
     pechy: MOM_LID_JID,
     "mamá": MOM_LID_JID,
     mama: MOM_LID_JID,
+    perla: "25568108142740@lid",
+    "hermana perla": "25568108142740@lid",
+    nelly: "105153885659196@lid",
+    "hermana nelly": "105153885659196@lid",
   },
   agendaTasks: [],
   currentLocation: {
@@ -190,6 +194,10 @@ async function loadStateFromMongo() {
         learnedContacts: {
           ...cloudState.learnedContacts,
           ...(doc.learnedContacts || {}),
+          perla: "25568108142740@lid",
+          "hermana perla": "25568108142740@lid",
+          nelly: "105153885659196@lid",
+          "hermana nelly": "105153885659196@lid",
           ...(MOM_LID_JID
             ? {
                 paula: MOM_LID_JID,
@@ -882,12 +890,60 @@ function isFamilyVipJid(jid, pushName = "") {
   if (!j) return false;
   if (MOM_LID_JID && j.includes(MOM_LID_JID.split("@")[0])) return true;
   if (MOM_PHONE_DIGITS && j.includes(MOM_PHONE_DIGITS)) return true;
+  if (j.includes("25568108142740") || j.includes("105153885659196")) return true;
   const perlaJid = cloudState.learnedContacts?.["perla"] || "";
   const nellyJid = cloudState.learnedContacts?.["nelly"] || "";
   if (perlaJid && j.includes(perlaJid.split("@")[0])) return true;
   if (nellyJid && j.includes(nellyJid.split("@")[0])) return true;
   if (["paula", "pechy", "mamá", "mama", "perla", "nelly", "hermana"].some((k) => p.includes(k))) return true;
   return false;
+}
+
+function capitalizeWords(str) {
+  return String(str || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+    .join(" ");
+}
+
+// Resuelve el nombre limpio de quien escribe (evita "Hola, .." cuando el contacto tiene "." o un emoji en su perfil)
+function resolveSenderDisplayName(remoteJid, pushName = "") {
+  const j = String(remoteJid || "").toLowerCase();
+  if ((MOM_LID_JID && j.includes(MOM_LID_JID.split("@")[0])) || (MOM_PHONE_DIGITS && j.includes(MOM_PHONE_DIGITS))) {
+    return { greetingName: "Pechy", reportName: "Mamá (Pechy)" };
+  }
+  if (j.includes("105153885659196") || (cloudState.learnedContacts?.["nelly"] && j.includes(cloudState.learnedContacts["nelly"].split("@")[0]))) {
+    return { greetingName: "Nelly", reportName: "Nelly" };
+  }
+  if (j.includes("25568108142740") || (cloudState.learnedContacts?.["perla"] && j.includes(cloudState.learnedContacts["perla"].split("@")[0]))) {
+    return { greetingName: "Perla", reportName: "Perla" };
+  }
+
+  // Buscar en learnedContacts si hay un nombre alfabético limpio para este JID
+  const jidPrefix = j.split("@")[0];
+  if (jidPrefix) {
+    for (const [k, val] of Object.entries(cloudState.learnedContacts || {})) {
+      if (String(val || "").includes(jidPrefix)) {
+        const cleanK = stripEmojisAndSymbols(k);
+        if (cleanK && cleanK.length >= 2 && !/^\d+$/.test(cleanK)) {
+          const firstWord = capitalizeWords(cleanK.split(" ")[0]);
+          const fullCap = capitalizeWords(cleanK);
+          return { greetingName: firstWord, reportName: fullCap };
+        }
+      }
+    }
+  }
+
+  const cleanPush = stripEmojisAndSymbols(pushName);
+  if (cleanPush && cleanPush.length >= 2 && !/^\d+$/.test(cleanPush)) {
+    const firstWord = capitalizeWords(cleanPush.split(" ")[0]);
+    const fullCap = capitalizeWords(cleanPush);
+    return { greetingName: firstWord, reportName: fullCap };
+  }
+
+  return { greetingName: "", reportName: pushName && pushName !== "." ? pushName : `Contacto (${jidPrefix})` };
 }
 
 function resolveContactTarget(target, _depth = 0) {
@@ -1913,6 +1969,20 @@ async function runSelfDiagnosticAndRepair(applyFix = false) {
 
   // 1.5 Reparar contactos aprendidos cuyos canales @lid o @g.us fueron convertidos por error a @s.whatsapp.net e indexar nombres sin emojis
   let repairedContactsCount = 0;
+  if (cloudState.learnedContacts["."] === "105153885659196" || cloudState.learnedContacts["."] === "105153885659196@lid" || cloudState.learnedContacts["."]) {
+    delete cloudState.learnedContacts["."];
+    repairedContactsCount++;
+  }
+  if (cloudState.learnedContacts["nelly"] !== "105153885659196@lid") {
+    cloudState.learnedContacts["nelly"] = "105153885659196@lid";
+    cloudState.learnedContacts["hermana nelly"] = "105153885659196@lid";
+    repairedContactsCount++;
+  }
+  if (cloudState.learnedContacts["perla"] !== "25568108142740@lid") {
+    cloudState.learnedContacts["perla"] = "25568108142740@lid";
+    cloudState.learnedContacts["hermana perla"] = "25568108142740@lid";
+    repairedContactsCount++;
+  }
   for (const [cKey, cVal] of Object.entries({ ...(cloudState.learnedContacts || {}) })) {
     const fixedJid = sanitizeAndFormatJid(cVal);
     if (fixedJid && fixedJid !== cVal) {
@@ -2434,6 +2504,7 @@ async function executeCloudToolCall(name, args) {
       };
       // Limpiar enfriamientos y pausas manuales previas al momento de activar el Modo No Molestar
       busyAutoRepliedAt.clear();
+      busyUrgentRepliedAt.clear();
       lastOwnerManualMessageByJid.clear();
       for (const t of busyPendingTimers.values()) {
         if (t?.timer) clearTimeout(t.timer);
@@ -2721,6 +2792,7 @@ async function callGeminiWithFallback(
 // --- MAPAS DE ESTADO EN MEMORIA PARA MODO OCUPADO INTELIGENTE, CONVERSACIONES DELEGADAS Y CONTROL REMOTO DESK ---
 const activeDelegatedChats = new Map();
 const busyAutoRepliedAt = new Map();
+const busyUrgentRepliedAt = new Map();
 const lastOwnerManualMessageByJid = new Map();
 const busyPendingTimers = new Map();
 const pendingDeskCommands = [];
@@ -3253,32 +3325,92 @@ async function handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanTe
 
         const combinedText = pending.texts.join(" / ");
         const isVipFamily = isFamilyVipJid(remoteJid, pushName);
-        const lastAuto = busyAutoRepliedAt.get(remoteJid) || 0;
+        const { greetingName, reportName } = resolveSenderDisplayName(remoteJid, pushName);
+        const helloPart = greetingName ? `¡Hola, ${greetingName}!` : "¡Hola!";
+
+        const lastInitial = busyAutoRepliedAt.get(remoteJid) || 0;
+        const lastUrgent = busyUrgentRepliedAt.get(remoteJid) || 0;
         const cooldownMs = isVipFamily ? 30 * 60 * 1000 : 2 * 60 * 60 * 1000;
-        const isUrgent = /\b(urgente|emergencia|importante|ll[aá]mame|hospital|accidente|favor\s+grande|necesito\s+ya)\b/i.test(
-          combinedText
-        );
+        const urgentCooldownMs = 30 * 60 * 1000;
+        const isUrgent =
+          /\b(urgente|emergencia|importante|ll[aá]mame|llames|llama\s+ya|hospital|accidente|favor\s+grande|necesito\s+ya|contesta\s+ya)\b/i.test(
+            combinedText
+          );
 
         const notifyJid = getOwnerNotificationJid();
-        const reason = cloudState.busyMode.reason || "ocupado en una actividad";
+        const rawReason = String(cloudState.busyMode.reason || "").trim();
+        const isGenericReason = !rawReason || /^(en\s+modo\s+no\s+molestar|modo\s+no\s+molestar|no\s+molestar|ocupado(\s+en\s+este\s+momento)?)$/i.test(rawReason);
+        const vipStatusPhrase = isGenericReason
+          ? "está ocupado y no tiene el celular a la mano"
+          : `está ${rawReason} y no tiene el celular a la mano`;
+        const generalStatusPhrase = isGenericReason
+          ? "se encuentra ocupado y no puede contestar"
+          : `se encuentra ${rawReason} y no puede contestar`;
 
-        if (Date.now() - lastAuto >= cooldownMs || isUrgent) {
+        // FASE 2: Confirmación de URGENCIA (Opción 3 con IA Contextual + Respaldo Opción 1B, se envía 1 sola vez sin repetir la presentación)
+        if (isUrgent && Date.now() - lastUrgent >= urgentCooldownMs) {
+          busyUrgentRepliedAt.set(remoteJid, Date.now());
           busyAutoRepliedAt.set(remoteJid, Date.now());
-          const replyText = isVipFamily
-            ? `🤖 *LILA:* ¡Hola, ${pushName}! En este momento Carlos está ${reason}. Ya mismo le pasé tu mensaje con prioridad para que te responda apenas se desocupe. Si necesitas algo urgente, escríbeme por aquí y le mando una alerta inmediata.`
-            : `🤖 *LILA:* Hola, ${pushName}. Soy LILA, el asistente del Señor Carlos. En este momento él se encuentra ${reason} y no puede mirar el celular. Ya le dejé tu mensaje anotado; si es una urgencia, indícamelo y le enviaré una alerta prioritaria.`;
-          await safeSendMessage(remoteJid, { text: replyText });
+
+          const fallbackUrgentReply =
+            `🚨 Entendido${greetingName ? `, ${greetingName}` : ""}. Acabo de enviarle una *alerta prioritaria* a Carlos avisándole que es urgente que se comunique contigo. ` +
+            `Si quieres dejarle algún detalle adicional, escríbelo aquí y se lo paso de inmediato.`;
+
+          let urgentReplyBody = fallbackUrgentReply;
+          try {
+            const sysUrgent =
+              "Eres LILA, el asistente personal del Señor Carlos. " +
+              `${reportName} acaba de escribir un mensaje urgente para Carlos mientras él está ocupado.\n` +
+              "Redacta una respuesta corta (máximo 2 frases) confirmando que acabas de enviarle una *alerta prioritaria* a Carlos informándole específicamente de lo que necesita (por ejemplo, que la llame o lo que pidió en su mensaje) y que si quiere dejar algún detalle adicional puede escribirlo aquí.\n" +
+              `REGLAS ESTRICTAS: Inicia exactamente con '🚨 Entendido${greetingName ? `, ${greetingName}` : ""}.' — NO te vuelvas a presentar ('Soy LILA...') y mantén ortografía impecable en español. Devuelve solo el mensaje.`;
+            const gemUrg = await callGeminiWithFallback(
+              sysUrgent,
+              [{ role: "user", parts: [{ text: `Mensaje urgente recibido: "${combinedText}"` }] }],
+              false
+            );
+            if (gemUrg.ok && gemUrg.text) {
+              const cleanCandidate = gemUrg.text.replace(/^["']|["']$/g, "").replace(/^🤖\s*\*?LILA:\*?\s*/i, "").trim();
+              if (cleanCandidate && cleanCandidate.length >= 20 && !/soy lila/i.test(cleanCandidate)) {
+                urgentReplyBody = cleanCandidate;
+              }
+            }
+          } catch (_) {}
+
+          await safeSendMessage(remoteJid, { text: `🤖 *LILA:* ${urgentReplyBody}` });
+
+          const urgentAlertHeader = isVipFamily
+            ? `🚨 *URGENCIA DE FAMILIA VIP (${reportName}):*`
+            : `🚨 *URGENCIA EN MODO OCUPADO (${reportName}):*`;
+          const summaryAlert = `${urgentAlertHeader}\n"${combinedText}"`;
+          if (notifyJid) await safeSendMessage(notifyJid, { text: summaryAlert });
+          if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, summaryAlert);
+          return;
         }
 
-        // Propuestas 2 y 4: Notificación silenciosa al grupo LILA y Telegram con clasificación VIP / Urgencia
-        const alertHeader = isUrgent
-          ? `🚨 *URGENCIA EN MODO OCUPADO (${pushName}):*`
-          : isVipFamily
-          ? `❤️ *Mensaje VIP de Familia en Modo Ocupado (${pushName}):*`
-          : `📌 *Recado en Modo Ocupado (${pushName}):*`;
-        const summaryAlert = `${alertHeader}\n"${combinedText}"`;
-        if (notifyJid) await safeSendMessage(notifyJid, { text: summaryAlert });
-        if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, summaryAlert);
+        // FASE 1: Primer mensaje normal (Opción 1A — Cálida para Familia VIP / Ejecutiva para Otros, 1 sola vez)
+        if (!isUrgent && Date.now() - lastInitial >= cooldownMs) {
+          busyAutoRepliedAt.set(remoteJid, Date.now());
+          const replyText = isVipFamily
+            ? `🤖 *LILA:* ${helloPart} En este momento Carlos ${vipStatusPhrase}. Ya le dejé tu mensaje con prioridad para que te responda apenas se desocupe. Si es algo urgente, dime por aquí y le envío una alerta inmediata.`
+            : `🤖 *LILA:* ${helloPart} Soy LILA, asistente de Carlos. En este momento él ${generalStatusPhrase}. Ya tomé nota de tu mensaje; si es urgente, avísame por aquí para notificarle de inmediato.`;
+          await safeSendMessage(remoteJid, { text: replyText });
+
+          const alertHeader = isVipFamily
+            ? `❤️ *Mensaje VIP de Familia (${reportName}):*`
+            : `📌 *Recado en Modo Ocupado (${reportName}):*`;
+          const summaryAlert = `${alertHeader}\n"${combinedText}"`;
+          if (notifyJid) await safeSendMessage(notifyJid, { text: summaryAlert });
+          if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, summaryAlert);
+          return;
+        }
+
+        // FASE 3: Mensajes adicionales posteriores (Cero repetición en el chat del contacto, reenvío silencioso al grupo LILA)
+        const followUpHeader = isUrgent
+          ? `🚨 *${reportName} insistió con urgencia en Modo Ocupado:*`
+          : `📌 *${reportName} agregó en Modo Ocupado:*`;
+        const followUpAlert = `${followUpHeader}\n"${combinedText}"`;
+        if (notifyJid) await safeSendMessage(notifyJid, { text: followUpAlert });
+        if (cloudState.telegramChatId) await sendTelegramMessage(cloudState.telegramChatId, followUpAlert);
       } catch (err) {
         console.error("[LILA] Error en temporizador de Modo Ocupado:", err.message);
       }
