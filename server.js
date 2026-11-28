@@ -750,7 +750,11 @@ function learnContactEntry(rawName, rawJid, persist = false) {
   if (!formattedJid || formattedJid === "status@broadcast") return false;
 
   const cleanOriginal = String(rawName).toLowerCase().trim();
-  if (!cleanOriginal || cleanOriginal === "hermana" || /^\d+$/.test(cleanOriginal)) return false;
+  const cleanAlphaCheck = stripEmojisAndSymbols(cleanOriginal);
+  // Ignorar nombres de perfil que sean solo un punto ".", símbolos "i~" o emojis sin letras reales
+  if (!cleanOriginal || cleanOriginal === "hermana" || /^\d+$/.test(cleanOriginal) || cleanAlphaCheck.length < 2) {
+    return false;
+  }
 
   let changed = false;
   if (!PROTECTED_CONTACT_KEYS.has(cleanOriginal) || !cloudState.learnedContacts[cleanOriginal]) {
@@ -3689,8 +3693,20 @@ async function startWhatsApp() {
           cleanText.startsWith("📌 *Recado");
         if (isLilaOwnSentMsg) continue;
 
-        // Si el Señor Carlos escribe MANUALMENTE en un chat privado (y no es un mensaje generado por LILA), activamos la Pausa Automática de 20 min del Modo No Molestar en ese chat
-        if (msg.key.fromMe && !isGroup) {
+        const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
+
+        // Si el Señor Carlos escribe MANUALMENTE un mensaje nuevo en vivo en un chat privado (DESPUÉS de activar el Modo No Molestar y no es comando para LILA),
+        // activamos la Pausa Automática de 20 min del Modo No Molestar en ese chat
+        const isFreshLiveManualMsg =
+          msg.key.fromMe &&
+          !isGroup &&
+          type === "notify" &&
+          msgAgeSeconds >= 0 &&
+          msgAgeSeconds <= 25 &&
+          !isCommandForLila &&
+          (!cloudState.busyMode?.activatedAt || Date.now() - cloudState.busyMode.activatedAt > 10000);
+
+        if (isFreshLiveManualMsg) {
           lastOwnerManualMessageByJid.set(remoteJid, Date.now());
           const pendingTimer = busyPendingTimers.get(remoteJid);
           if (pendingTimer) {
@@ -3726,7 +3742,6 @@ async function startWhatsApp() {
           continue;
         }
 
-        const isCommandForLila = /^lila(?:[,:\s]+([\s\S]*))?$/i.test(cleanText);
         if (!isCommandForLila) {
           if (!msg.key.fromMe && msgAgeSeconds <= 90) {
             await handleBusyModeAndDelegatedIncoming({ remoteJid, pushName, cleanText, isGroup });
